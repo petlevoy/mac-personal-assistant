@@ -794,6 +794,9 @@ struct SettingsView: View {
                     SecureField("Ключ модели",text: $modelKey)
                     Section("Генерация изображений · отдельная модель") {
                         Toggle("Включить генератор изображений",isOn:$imageEnabled)
+                        if imageEnabled && (imageBase.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty || imageModel.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty) {
+                            Text("Переключатель можно сохранить сейчас. Для генерации заполни адрес API и ID модели; при необходимости — ключ.").font(.caption).foregroundStyle(.secondary)
+                        }
                         TextField("Адрес OpenAI-совместимого Images API, с /v1",text:$imageBase)
                         TextField("ID модели изображений",text:$imageModel)
                         SecureField("Ключ генератора изображений",text:$imageKey)
@@ -877,6 +880,7 @@ struct SettingsView: View {
                     }.padding()
                 } }.frame(maxHeight:.infinity)
             }
+            if !model.error.isEmpty { Text(model.error).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
             HStack { Button("Сохранить и закрыть") { save(fetch:false, close:true) }; Spacer(); Button("Сохранить",action: { save(fetch: false) }).disabled(model.running) }
         }.padding(24).frame(width: 1000,height: 720).modifier(AppTheme()).tint(.gray).accentColor(.gray).buttonStyle(MonochromeButton()).interactiveDismissDisabled()
         .onAppear {
@@ -895,6 +899,7 @@ struct SettingsView: View {
         if panel.runModal() == .OK, let url=panel.url { selectedModel=url.path; provider="local"; if mode == "cloud" { mode="offline" }; save(fetch:false,load:true) }
     }
     func save(fetch: Bool, load: Bool = false, close: Bool = false) {
+        model.error = ""
         model.perform {
             _ = try await model.api("/settings", ["imageEnabled":imageEnabled,"imageBaseURL":imageBase,"imageModel":imageModel,"thermalEnabled":thermalEnabled,"thermalLimit":thermalLimit,"mode":mode,"provider":provider,"baseURL":base,"model":selectedModel,"contextLimit":limit,"temperature":temperature,"toolsEnabled":toolsEnabled,"searchProvider":searchProvider])
             try Keys.set("image",imageKey); try Keys.set("model",modelKey); try Keys.set("brave",braveKey);try Keys.set("tavily",tavilyKey);try Keys.set("serper",serperKey)

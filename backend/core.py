@@ -238,9 +238,8 @@ class Store(Features):
             new={**self.data['settings'],**{k:v for k,v in settings.items() if k in allowed}}
             if new['provider']!='local': validate_endpoint(new['baseURL'],new['mode'],new['provider'])
             elif new['mode']=='cloud': raise ValueError('Для встроенной модели выбери локальный режим')
-            if new.get('imageEnabled'):
-                validate_endpoint(new.get('imageBaseURL',''),'cloud','openai')
-                if not str(new.get('imageModel','')).strip(): raise ValueError('Укажи модель изображений')
+            # Image configuration may be saved as a draft. Validate at generation time.
+            new['imageEnabled']=bool(new.get('imageEnabled',False))
             new['contextLimit']=max(1024,min(int(new['contextLimit']),131072))
             new['temperature']=max(0,min(float(new['temperature']),2))
             if new.get('searchProvider','brave') not in ('brave','tavily','serper'): raise ValueError('Неизвестный поиск')

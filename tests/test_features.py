@@ -9,6 +9,16 @@ class FeatureTests(unittest.TestCase):
   self.pid=self.s.data['projects'][0]['id'];self.cid=self.s.project(self.pid)['chats'][0]['id']
  def tearDown(self): self.tmp.cleanup()
  def job(self): return {'id':'test','projectID':self.pid,'chatID':self.cid,'stop':threading.Event()}
+ def test_image_draft_can_enable_save_reopen_and_disable(self):
+  from image_generation import generate
+  self.s.update_settings({'imageEnabled':True,'imageBaseURL':'','imageModel':''})
+  reopened=Store(self.s.root)
+  self.assertTrue(reopened.data['settings']['imageEnabled'])
+  self.assertEqual(reopened.data['settings']['imageBaseURL'],'')
+  with self.assertRaises(ValueError):
+   generate(reopened,self.job(),{'prompt':'test'},{**reopened.data['settings'],'mode':'internet'})
+  reopened.update_settings({'imageEnabled':False})
+  self.assertFalse(Store(self.s.root).data['settings']['imageEnabled'])
  def test_profile_version_restore_and_persist(self):
   p=copy.deepcopy(self.s.data['profiles'][0]);self.s.profile_save({'id':p['id'],'name':'New','prompt':'Changed'})
   version=self.s.data['profiles'][0]['versions'][0]['id'];self.s.profile_restore(p['id'],version)
