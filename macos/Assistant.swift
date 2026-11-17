@@ -36,15 +36,135 @@ enum ChatMarkdown {
     }
 }
 
+// A deliberately small, offline block renderer. Raw HTML stays inert text.
+enum MarkdownBlock: Equatable {
+    case text(String), heading(Int, String), code(String, String), quote(String), table([[String]]), rule
+}
+enum MarkdownBlocks {
+    static func cells(_ line: String) -> [String] {
+        var value = line.trimmingCharacters(in: .whitespaces)
+        if value.hasPrefix("|") { value.removeFirst() }
+        if value.hasSuffix("|") { value.removeLast() }
+        return value.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+    static func separator(_ line: String) -> Bool {
+        let parts = cells(line)
+        return line.contains("|") && !parts.isEmpty && parts.allSatisfy {
+            let value = $0.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+            return value.count >= 3 && value.allSatisfy { $0 == "-" }
+        }
+    }
+    static func parse(_ source: String) -> [MarkdownBlock] {
+        let lines = source.components(separatedBy: "\n")
+        var result: [MarkdownBlock] = []; var i = 0
+        while i < lines.count {
+            let line = lines[i]; let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") {
+                let language = String(trimmed.dropFirst(3)); i += 1; var body: [String] = []
+                while i < lines.count && !lines[i].trimmingCharacters(in: .whitespaces).hasPrefix("```") { body.append(lines[i]); i += 1 }
+                result.append(.code(language, body.joined(separator: "\n"))); i += 1; continue
+            }
+            if i + 1 < lines.count && line.contains("|") && separator(lines[i+1]) {
+                var rows = [cells(line)]; i += 2
+                while i < lines.count && lines[i].contains("|") && !lines[i].trimmingCharacters(in: .whitespaces).isEmpty { rows.append(cells(lines[i])); i += 1 }
+                result.append(.table(rows)); continue
+            }
+            let hashes = trimmed.prefix { $0 == "#" }.count
+            if (1...6).contains(hashes) && trimmed.dropFirst(hashes).hasPrefix(" ") {
+                result.append(.heading(hashes, String(trimmed.dropFirst(hashes+1))))
+            } else if trimmed.hasPrefix(">") {
+                result.append(.quote(String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces)))
+            } else if ["---", "***", "___"].contains(trimmed) { result.append(.rule) }
+            else if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") { result.append(.text("• " + trimmed.dropFirst(2))) }
+            else { result.append(.text(line)) }
+            i += 1
+        }
+        return result
+    }
+}
 struct ChatMessageText: View {
     let content: String
+    @AppStorage("chatFontSize") private var fontSize = 14.0
     var body: some View {
-        Text(ChatMarkdown.render(content))
-            .tint(.accentColor)
-            .textSelection(.enabled)
-            .environment(\.openURL, OpenURLAction { url in
-                ChatMarkdown.safeURL(url) ? .systemAction : .discarded
-            })
+        VStack(alignment: .leading, spacing: 5) {
+            ForEach(Array(MarkdownBlocks.parse(content).enumerated()), id: \.offset) { _, block in
+                blockView(block)
+            }
+        }.font(.system(size: fontSize)).tint(.accentColor).textSelection(.enabled)
+            .environment(\.openURL, OpenURLAction { url in ChatMarkdown.safeURL(url) ? .systemAction : .discarded })
+    }
+    @ViewBuilder func blockView(_ block: MarkdownBlock) -> some View {
+        switch block {
+        case .text(let text): Text(ChatMarkdown.render(text.isEmpty ? " " : text))
+        case .heading(let level, let text): Text(ChatMarkdown.render(text)).font(.system(size: fontSize + Double(7-level), weight: .bold)).padding(.top, 4)
+        case .quote(let text): HStack { Rectangle().fill(Color.secondary).frame(width: 3); Text(ChatMarkdown.render(text)).italic() }.fixedSize(horizontal: false, vertical: true).padding(.leading, 6)
+        case .rule: Divider().padding(.vertical, 4)
+        case .code(let language, let code):
+            VStack(alignment: .leading, spacing: 4) {
+                HStack { Text(language.isEmpty ? "Код" : language).font(.caption); Spacer(); Button("Копировать") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(code, forType: .string) }.font(.caption) }
+                ScrollView(.horizontal) { Text(code).font(.system(size: fontSize, design: .monospaced)).fixedSize(horizontal: true, vertical: false) }
+            }.padding(10).background(Color.primary.opacity(0.06)).cornerRadius(6)
+        case .table(let rows):
+            ScrollView(.horizontal) {
+                Grid(alignment: .topLeading, horizontalSpacing: 0, verticalSpacing: 0) {
+                    ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
+                        GridRow {
+                            ForEach(0..<(rows.map { $0.count }.max() ?? 0), id: \.self) { column in
+                                Text(ChatMarkdown.render(column < row.count ? row[column] : ""))
+                                    .fontWeight(rowIndex == 0 ? .semibold : .regular)
+                                    .frame(minWidth: 90, maxWidth: 260, alignment: .leading).padding(7)
+                                    .background(Color.primary.opacity(rowIndex == 0 ? 0.1 : 0.03))
+                                    .border(Color.secondary.opacity(0.25), width: 0.5)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Isolated suite in smoke tests; production drafts persist across restarts.
+final class DraftStore {
+    let defaults: UserDefaults
+    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+    func key(_ project: String, _ chat: String) -> String { "chatDraft." + project + "." + chat }
+    func read(_ project: String, _ chat: String) -> String { defaults.string(forKey: key(project,chat)) ?? "" }
+    func write(_ value: String, _ project: String, _ chat: String) {
+        guard !project.isEmpty && !chat.isEmpty else { return }
+        if value.isEmpty { defaults.removeObject(forKey: key(project,chat)) }
+        else { defaults.set(value, forKey: key(project,chat)) }
+    }
+}
+
+enum ChatTranscript {
+    static func attributed(title: String, messages: [ChatMessage], size: Double) -> NSAttributedString {
+        let out = NSMutableAttributedString(string: title + "\n\n", attributes: [.font: NSFont.boldSystemFont(ofSize: size+5)])
+        for message in messages where message.role != "tool" {
+            out.append(NSAttributedString(string: (message.role == "user" ? "Ты" : "Помощник") + "\n", attributes: [.font: NSFont.boldSystemFont(ofSize: size)]))
+            for block in MarkdownBlocks.parse(message.content) {
+                var text = ""; var font = NSFont.systemFont(ofSize: size)
+                switch block {
+                case .text(let value), .quote(let value): text = value
+                case .heading(let level, let value): text = value; font = .boldSystemFont(ofSize: size+Double(7-level))
+                case .code(_, let value): text = value; font = .monospacedSystemFont(ofSize: size, weight: .regular)
+                case .table(let rows): text = rows.map { $0.joined(separator: "  |  ") }.joined(separator: "\n"); font = .monospacedSystemFont(ofSize: size, weight: .regular)
+                case .rule: text = "────────────────────────"
+                }
+                out.append(NSAttributedString(string: text + "\n", attributes: [.font: font, .foregroundColor: NSColor.black]))
+            }
+            out.append(NSAttributedString(string: "\n"))
+        }
+        return out
+    }
+    @MainActor static func textView(title: String, messages: [ChatMessage], size: Double) -> NSTextView {
+        let view = NSTextView(frame: NSRect(x: 0, y: 0, width: 515, height: 720))
+        view.textContainer?.containerSize = NSSize(width: 515, height: CGFloat.greatestFiniteMagnitude)
+        view.textContainer?.widthTracksTextView = true
+        view.isVerticallyResizable = true; view.isHorizontallyResizable = false
+        view.textStorage?.setAttributedString(attributed(title: title, messages: messages, size: size))
+        view.sizeToFit()
+        return view
     }
 }
 
@@ -236,9 +356,11 @@ struct BrowserView: NSViewRepresentable {
 
 @MainActor final class AppModel: ObservableObject {
     @Published var snapshot: Snapshot?
-    @Published var projectID = ""
-    @Published var chatID = ""
-    @Published var draft = ""
+    @Published var projectID = "" { didSet { selectDraft() } }
+    @Published var chatID = "" { didSet { selectDraft() } }
+    @Published var draft = "" { didSet { draftStore.write(draft, projectID, chatID) } }
+    let draftStore = DraftStore(defaults: CommandLine.arguments.contains("--smoke-test") ? UserDefaults(suiteName: "Inij-Smoke-Drafts")! : .standard)
+    func selectDraft() { draft = draftStore.read(projectID, chatID) }
     @Published var error = ""
     @Published var startup = "Запуск локального сервиса…"
     @Published var showBrowser = false
@@ -345,7 +467,7 @@ struct BrowserView: NSViewRepresentable {
     }
     func send() {
         let text = draft; let pid = projectID; let cid = chatID
-        perform { _ = try await self.api("/send", ["projectID": pid, "chatID": cid, "text": text]); self.draft = "" }
+        perform { _ = try await self.api("/send", ["projectID": pid, "chatID": cid, "text": text]); if self.projectID == pid && self.chatID == cid && self.draft == text { self.draft = "" } else if self.draftStore.read(pid,cid) == text { self.draftStore.write("",pid,cid) } }
     }
     func stop() { perform { _ = try await self.api("/stop", [:]); self.browser.webView.stopLoading(); self.browser.finish(AppError(message: "Остановлено")) } }
     func newChat() { perform { let r = try await self.api("/chat", ["projectID": self.projectID]); self.chatID = r["id"] as? String ?? "" } }
@@ -422,7 +544,11 @@ struct BrowserView: NSViewRepresentable {
         let panel = NSOpenPanel(); panel.canChooseFiles = true; panel.canChooseDirectories = false
         panel.message = "Текст будет вставлен в сообщение; в облачном режиме он уйдет выбранному провайдеру. До 12 МБ."
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let pid = projectID
+        attach(url)
+    }
+    func attach(_ url: URL) {
+        guard url.isFileURL else { error = "Перетащи локальный файл"; return }
+        let pid = projectID; let cid = chatID
         perform {
             let size = (try url.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? 0
             guard size <= 12 * 1024 * 1024 else { throw AppError(message: "Файл больше 12 МБ") }
@@ -458,7 +584,9 @@ struct BrowserView: NSViewRepresentable {
             }
             let r = try await self.api("/attachment", payload)
             let note = (r["truncated"] as? Bool == true) ? " [ОБРЕЗАНО до 60000 символов]" : ""
-            self.draft += "\n\n[Файл: \(url.lastPathComponent)\(note)]\n\(r["text"] as? String ?? "")\n[Конец файла]\n"
+            let addition = "\n\n[Файл: \(url.lastPathComponent)\(note)]\n\(r["text"] as? String ?? "")\n[Конец файла]\n"
+            if self.projectID == pid && self.chatID == cid { self.draft += addition }
+            else { self.draftStore.write(self.draftStore.read(pid,cid) + addition, pid,cid) }
         }
     }
 }
@@ -486,12 +614,28 @@ struct MonochromeButton: ButtonStyle {
     }
 }
 struct Composer: NSViewRepresentable {
+    @AppStorage("chatFontSize") private var fontSize = 14.0
     @Binding var text: String
     var enterSends: Bool
     var send: () -> Void
+    var files: (([URL]) -> Void)? = nil
     final class Input: NSTextView {
         var submit: (() -> Void)?
         var enterSends = true
+        var files: (([URL]) -> Void)?
+        static func fileURLs(_ pasteboard: NSPasteboard) -> [URL] {
+            (pasteboard.readObjects(forClasses:[NSURL.self], options:[.urlReadingFileURLsOnly:true]) as? [URL]) ?? []
+        }
+        override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+            if !Self.fileURLs(sender.draggingPasteboard).isEmpty { return files == nil ? [] : .copy }
+            return super.draggingEntered(sender)
+        }
+        override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { draggingEntered(sender) }
+        override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+            let urls = Self.fileURLs(sender.draggingPasteboard)
+            if !urls.isEmpty { guard let files else { return false }; files(urls); return true }
+            return super.performDragOperation(sender)
+        }
         override func keyDown(with event: NSEvent) {
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             if event.keyCode == 36 && !hasMarkedText() {
@@ -509,6 +653,7 @@ struct Composer: NSViewRepresentable {
     func makeNSView(context: Context) -> NSScrollView {
         let scroll=NSScrollView(); scroll.hasVerticalScroller=true; scroll.drawsBackground=false
         let input=Input(); input.isRichText=false; input.font=NSFont.systemFont(ofSize:NSFont.systemFontSize)
+        input.registerForDraggedTypes([.fileURL])
         input.textColor = .textColor; input.backgroundColor = .textBackgroundColor
         input.minSize=NSSize(width:0,height:80); input.maxSize=NSSize(width:CGFloat.greatestFiniteMagnitude,height:CGFloat.greatestFiniteMagnitude)
         input.isVerticallyResizable=true; input.isHorizontallyResizable=false
@@ -521,13 +666,18 @@ struct Composer: NSViewRepresentable {
         context.coordinator.parent=self
         guard let input=scroll.documentView as? Input else { return }
         if input.string != text { input.string=text }
-        input.enterSends=enterSends; input.submit=send
+        input.enterSends=enterSends; input.submit=send; input.files=files; input.font = NSFont.systemFont(ofSize:fontSize)
     }
 }
 struct MainView: View {
     @AppStorage("enterSends") private var enterSends = true
     @EnvironmentObject var model: AppModel
     @State private var modelPickerShown = false
+    @AppStorage("chatFontSize") private var chatFontSize = 14.0
+    @State private var searchText = ""
+    var visibleMessages: [(offset: Int, element: ChatMessage)] {
+        Array((model.chat?.messages ?? []).enumerated()).filter { searchText.isEmpty || $0.element.content.localizedCaseInsensitiveContains(searchText) }
+    }
     var body: some View {
         HStack(spacing:0) {
             VStack(spacing: 8) {
@@ -580,14 +730,21 @@ struct MainView: View {
                     }
                     if !model.startup.isEmpty { Text(model.startup).padding(); Button("Повторить запуск") { Task { await model.start() } } }
                     if model.snapshot?.settings.model.isEmpty == true { Text("Выбери файл GGUF в настройках или скачай модель в Explore.").padding(); Button("Настроить модель") { model.settingsShown = true } }
+                    HStack {
+                        TextField("Поиск в этом чате", text: $searchText).textFieldStyle(.roundedBorder)
+                        if !searchText.isEmpty { Text("\(visibleMessages.count)").font(.caption); Button("Сброс") { searchText = "" } }
+                        Menu { ForEach([12.0,14,16,18,20,24], id: \.self) { size in Button("\(Int(size)) пт") { chatFontSize = size } } label: { Text("Аа") }.help("Размер текста")
+                        Button { printChat() } label: { Image(systemName: "printer") }.help("Печать / сохранить PDF").disabled(model.chat == nil)
+                    }.padding(.horizontal,12).padding(.vertical,6)
                     ScrollViewReader { proxy in
                         ScrollView {
                             LazyVStack(alignment: .leading, spacing: 16) {
-                                ForEach(Array((model.chat?.messages ?? []).enumerated()), id: \.offset) { index, message in
+                                ForEach(visibleMessages, id: \.offset) { index, message in
                                     if message.role != "tool" {
                                         VStack(alignment: .leading, spacing: 6) {
                                             Text(message.role == "user" ? "Ты" : "Помощник").font(.caption.bold()).foregroundStyle(.secondary)
                                             if message.role == "user" { Button("Изменить") { model.editMessage(index,message.content) }.font(.caption).disabled(model.running) }
+                                            Button("Цитировать") { model.draft += (model.draft.isEmpty ? "" : "\n\n") + message.content.components(separatedBy: "\n").map { "> " + $0 }.joined(separator: "\n") + "\n\n" }.font(.caption)
                                             ChatMessageText(content: message.content.isEmpty && message.streaming == true ? "…" : message.content)
                                                 .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                                         }.padding(14).background(message.role == "user" ? Color.primary.opacity(0.08) : Color.secondary.opacity(0.06))
@@ -639,9 +796,9 @@ struct MainView: View {
                             .buttonStyle(.plain).help("Выбрать модель").disabled(model.running)
                             .popover(isPresented:$modelPickerShown) { ModelPickerPopup(model:model, isPresented:$modelPickerShown) }
                         Spacer()
-                        Button(action: model.attach) { Image(systemName: "paperclip") }.disabled(model.running)
+                        Button(action: { model.attach() }) { Image(systemName: "paperclip") }.disabled(model.running)
                     }.padding(.horizontal,12).padding(.top,8)
-                    Composer(text: $model.draft, enterSends: enterSends, send: { if !model.running { model.send() } }).frame(height:90).padding(8)
+                    Composer(text: $model.draft, enterSends: enterSends, send: { if !model.running { model.send() } }, files: model.running ? nil : { urls in urls.forEach { model.attach($0) } }).frame(height:90).padding(8)
                     HStack {
                         Button("Повторить ответ") { model.changeChat("retry") }.disabled(model.running || (model.chat?.messages.isEmpty ?? true))
                         Text(enterSends ? "↩ — отправить · ⇧↩ — новая строка" : "⌘↩ — отправить · ↩ — новая строка").font(.caption).foregroundStyle(.secondary)
@@ -669,6 +826,16 @@ struct MainView: View {
             }.padding().frame(width: 760,height: 600)
         }
         .alert("Сообщение", isPresented: Binding(get: { !model.error.isEmpty },set: { if !$0 { model.error = "" } })) { Button("OK") { model.error = "" } } message: { Text(model.error) }
+    }
+    func printChat() {
+        guard let chat = model.chat else { return }
+        let view = ChatTranscript.textView(title:chat.title, messages:chat.messages, size:chatFontSize)
+        let info = NSPrintInfo.shared.copy() as! NSPrintInfo
+        info.horizontalPagination = .fit; info.verticalPagination = .automatic
+        info.isHorizontallyCentered = false; info.topMargin = 36; info.bottomMargin = 36
+        let operation = NSPrintOperation(view:view, printInfo:info)
+        operation.showsPrintPanel = true; operation.showsProgressPanel = true
+        operation.run()
     }
     var telemetryLabel: String {
         let t=model.snapshot?.thermal

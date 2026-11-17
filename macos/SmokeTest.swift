@@ -152,6 +152,44 @@ import Foundation
             try require(host.bounds.height >= 350,"model picker list has stable height with long filenames")
             panel.orderOut(nil)
         }
+        let markdownFixture = "# Заголовок\n\n| Имя | Значение |\n| --- | --- |\n| Один | **Два** |\n\n```swift\nlet x = 1\n```\n> Цитата\n- Пункт"
+        let blocks = MarkdownBlocks.parse(markdownFixture)
+        try require(blocks.contains(.heading(1, "Заголовок")) && blocks.contains(.table([["Имя","Значение"],["Один","**Два**"]])) && blocks.contains(.code("swift","let x = 1")), "block Markdown parses heading, table and fenced code")
+        try require(MarkdownBlocks.parse("```\npartial").contains(.code("","partial")), "streaming unfinished code fence is retained")
+        let suite = "Inij-Draft-Test-" + UUID().uuidString
+        let defaults = UserDefaults(suiteName:suite)!
+        defer { defaults.removePersistentDomain(forName:suite) }
+        let store = DraftStore(defaults:defaults)
+        store.write("Первый", "p", "a"); store.write("Второй", "p", "b")
+        let reloaded = DraftStore(defaults:UserDefaults(suiteName:suite)!)
+        try require(reloaded.read("p","a") == "Первый" && reloaded.read("p","b") == "Второй" && reloaded.read("other","a").isEmpty, "draft reload preserves separate chat and project identities")
+        store.write("", "p","a")
+        try require(reloaded.read("p","a").isEmpty && reloaded.read("p","b") == "Второй", "sending one draft does not clear another")
+        let pid = model.projectID; let cid = model.chatID
+        let originalDraft = model.draft
+        model.draft = "Draft A"
+        model.chatID = "smoke-alternate-chat"
+        model.draft = "Draft B"
+        model.chatID = cid
+        try require(model.draft == "Draft A", "native chat selection restores its own draft")
+        model.chatID = "smoke-alternate-chat"
+        try require(model.draft == "Draft B", "native alternate chat retains draft")
+        model.draft = ""; model.projectID = pid; model.chatID = cid; model.draft = originalDraft
+        let transcript = ChatTranscript.textView(title:"Проверка PDF",messages:[ChatMessage(role:"assistant",content:markdownFixture)],size:14)
+        let pdf = transcript.dataWithPDF(inside:transcript.bounds)
+        try require(pdf.starts(with:Data("%PDF".utf8)) && pdf.count > 500, "chat transcript renders an actual PDF")
+        try pdf.write(to:URL(fileURLWithPath:reportPath + "-chat.pdf"))
+        let renderedHost = NSHostingView(rootView:ChatMessageText(content:markdownFixture).padding(20).frame(width:620,height:460,alignment:.topLeading))
+        let renderedWindow = NSWindow(contentRect:NSRect(x:100,y:100,width:620,height:460),styleMask:[.titled],backing:.buffered,defer:false)
+        renderedWindow.contentView=renderedHost; renderedWindow.makeKeyAndOrderFront(nil)
+        try await Task.sleep(nanoseconds:300_000_000)
+        renderedHost.layoutSubtreeIfNeeded()
+        guard let bitmap=renderedHost.bitmapImageRepForCachingDisplay(in:renderedHost.bounds) else { throw AppError(message:"Markdown bitmap missing") }
+        renderedHost.cacheDisplay(in:renderedHost.bounds,to:bitmap)
+        guard let png=bitmap.representation(using:.png,properties:[:]) else { throw AppError(message:"Markdown PNG missing") }
+        try png.write(to:URL(fileURLWithPath:reportPath+"-markdown.png"))
+        renderedWindow.orderOut(nil)
+        checks.append("block Markdown native view rendered to PNG")
         let richSource = "**Новости**\n[Источник](https://example.com/news?q=1) и *курсив*\nОбычный URL: https://example.org/page\n`https://code.example/path`"
         let rich = ChatMarkdown.render(richSource)
         try require(String(rich.characters).contains("Новости\nИсточник и курсив\n"), "Markdown labels and Cyrillic line breaks preserved")
