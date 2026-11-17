@@ -139,9 +139,9 @@ final class DraftStore {
 
 enum ChatTranscript {
     static func attributed(title: String, messages: [ChatMessage], size: Double) -> NSAttributedString {
-        let out = NSMutableAttributedString(string: title + "\n\n", attributes: [.font: NSFont.boldSystemFont(ofSize: size+5)])
+        let out = NSMutableAttributedString(string: title + "\n\n", attributes: [.font: NSFont.boldSystemFont(ofSize: size+5), .foregroundColor: NSColor.black])
         for message in messages where message.role != "tool" {
-            out.append(NSAttributedString(string: (message.role == "user" ? "Ты" : "Помощник") + "\n", attributes: [.font: NSFont.boldSystemFont(ofSize: size)]))
+            out.append(NSAttributedString(string: (message.role == "user" ? "Ты" : "Помощник") + "\n", attributes: [.font: NSFont.boldSystemFont(ofSize: size), .foregroundColor: NSColor.black]))
             for block in MarkdownBlocks.parse(message.content) {
                 var text = ""; var font = NSFont.systemFont(ofSize: size)
                 switch block {
@@ -161,6 +161,7 @@ enum ChatTranscript {
         let view = NSTextView(frame: NSRect(x: 0, y: 0, width: 515, height: 720))
         view.textContainer?.containerSize = NSSize(width: 515, height: CGFloat.greatestFiniteMagnitude)
         view.textContainer?.widthTracksTextView = true
+        view.backgroundColor = .white; view.textColor = .black
         view.isVerticallyResizable = true; view.isHorizontallyResizable = false
         view.textStorage?.setAttributedString(attributed(title: title, messages: messages, size: size))
         view.sizeToFit()
@@ -730,12 +731,7 @@ struct MainView: View {
                     }
                     if !model.startup.isEmpty { Text(model.startup).padding(); Button("Повторить запуск") { Task { await model.start() } } }
                     if model.snapshot?.settings.model.isEmpty == true { Text("Выбери файл GGUF в настройках или скачай модель в Explore.").padding(); Button("Настроить модель") { model.settingsShown = true } }
-                    HStack {
-                        TextField("Поиск в этом чате", text: $searchText).textFieldStyle(.roundedBorder)
-                        if !searchText.isEmpty { Text("\(visibleMessages.count)").font(.caption); Button("Сброс") { searchText = "" } }
-                        Menu { ForEach([12.0,14,16,18,20,24], id: \.self) { size in Button("\(Int(size)) пт") { chatFontSize = size } } label: { Text("Аа") }.help("Размер текста")
-                        Button { printChat() } label: { Image(systemName: "printer") }.help("Печать / сохранить PDF").disabled(model.chat == nil)
-                    }.padding(.horizontal,12).padding(.vertical,6)
+                    chatToolbar
                     ScrollViewReader { proxy in
                         ScrollView {
                             LazyVStack(alignment: .leading, spacing: 16) {
@@ -826,6 +822,14 @@ struct MainView: View {
             }.padding().frame(width: 760,height: 600)
         }
         .alert("Сообщение", isPresented: Binding(get: { !model.error.isEmpty },set: { if !$0 { model.error = "" } })) { Button("OK") { model.error = "" } } message: { Text(model.error) }
+    }
+    var chatToolbar: some View {
+        HStack {
+                        TextField("Поиск в этом чате", text: $searchText).textFieldStyle(.roundedBorder)
+                        if !searchText.isEmpty { Text("\(visibleMessages.count)").font(.caption); Button("Сброс") { searchText = "" } }
+                        Menu { ForEach([12.0,14,16,18,20,24], id: \.self) { size in Button("\(Int(size)) пт") { chatFontSize = size } } } label: { Text("Аа") }.help("Размер текста")
+                        Button { printChat() } label: { Image(systemName: "printer") }.help("Печать / сохранить PDF").disabled(model.chat == nil)
+                    }.padding(.horizontal,12).padding(.vertical,6)
     }
     func printChat() {
         guard let chat = model.chat else { return }
