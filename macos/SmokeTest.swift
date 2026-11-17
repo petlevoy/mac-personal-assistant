@@ -152,6 +152,33 @@ import Foundation
             try require(host.bounds.height >= 350,"model picker list has stable height with long filenames")
             panel.orderOut(nil)
         }
+        let richSource = "**Новости**\n[Источник](https://example.com/news?q=1) и *курсив*\nОбычный URL: https://example.org/page\n`https://code.example/path`"
+        let rich = ChatMarkdown.render(richSource)
+        try require(String(rich.characters).contains("Новости\nИсточник и курсив\n"), "Markdown labels and Cyrillic line breaks preserved")
+        try require(rich.runs.contains { $0.inlinePresentationIntent?.contains(.stronglyEmphasized) == true }, "Markdown bold is attributed")
+        try require(rich.runs.contains { $0.inlinePresentationIntent?.contains(.emphasized) == true }, "Markdown emphasis is attributed")
+        let targets = rich.runs.compactMap { $0.link?.absoluteString }
+        try require(targets.contains("https://example.com/news?q=1") && targets.contains("https://example.org/page"), "semantic and plain web URLs have clickable link attributes")
+        try require(!targets.contains("https://code.example/path"), "inline code is not auto-linked")
+        let unsafe = ChatMarkdown.render("[файл](file:///etc/passwd) [скрипт](javascript:alert) [ssh](ssh://host)")
+        try require(unsafe.runs.allSatisfy { $0.link == nil }, "unsafe URL schemes removed")
+        try require(!ChatMarkdown.safeURL(URL(string:"file:///tmp/test")!) && ChatMarkdown.safeURL(URL(string:"https://example.com")!), "click routing only allows HTTP and HTTPS")
+        for prefix in ["", "**Нов", "[Источ", "[Источник](https://exa", "Строка\n\nследующая"] {
+            _ = ChatMarkdown.render(prefix)
+        }
+        try require(String(ChatMarkdown.render("Строка\n\nследующая").characters) == "Строка\n\nследующая", "streaming partial Markdown tolerates incomplete syntax and blank lines")
+        if CommandLine.arguments.contains("--links-capture") {
+            let host = NSHostingView(rootView: ChatMessageText(content: richSource).padding(20).frame(width:600,height:250,alignment:.topLeading))
+            let panel=NSWindow(contentRect:NSRect(x:100,y:100,width:600,height:250),styleMask:[.titled],backing:.buffered,defer:false)
+            panel.contentView=host; panel.makeKeyAndOrderFront(nil)
+            try await Task.sleep(nanoseconds:1_000_000_000)
+            host.layoutSubtreeIfNeeded()
+            guard let bitmap=host.bitmapImageRepForCachingDisplay(in:host.bounds) else { throw AppError(message:"Links bitmap missing") }
+            host.cacheDisplay(in:host.bounds,to:bitmap)
+            guard let png=bitmap.representation(using:.png,properties:[:]) else { throw AppError(message:"Links PNG missing") }
+            try png.write(to:URL(fileURLWithPath:reportPath+"-links.png"))
+            panel.orderOut(nil)
+        }
         window.orderOut(nil)
         _ = delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: false)
         try require(window.isVisible, "Dock reopen handler restores main window")

@@ -6,6 +6,48 @@ import PDFKit
 import Vision
 import UniformTypeIdentifiers
 
+// Shared by the chat and native rendering checks. No HTML or remote content is loaded.
+enum ChatMarkdown {
+    static func safeURL(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = url.host, !host.isEmpty else { return false }
+        return true
+    }
+    static func render(_ source: String) -> AttributedString {
+        var text = (try? AttributedString(markdown: source, options: .init(
+            interpretedSyntax: .inlineOnlyPreservingWhitespace,
+            failurePolicy: .returnPartiallyParsedIfPossible))) ?? AttributedString(source)
+        // A model may emit arbitrary URI schemes. Only web links are actionable.
+        for run in Array(text.runs) {
+            if let url = run.link, !safeURL(url) { text[run.range].link = nil }
+        }
+        let plain = String(text.characters)
+        if let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) {
+            for match in detector.matches(in: plain, range: NSRange(plain.startIndex..., in: plain)) {
+                guard let url = match.url, safeURL(url), let range = Range(match.range, in: plain),
+                      let a = AttributedString.Index(range.lowerBound, within: text),
+                      let b = AttributedString.Index(range.upperBound, within: text) else { continue }
+                let slice = text[a..<b]
+                guard !slice.runs.contains(where: { $0.link != nil || $0.inlinePresentationIntent?.contains(.code) == true }) else { continue }
+                text[a..<b].link = url
+            }
+        }
+        return text
+    }
+}
+
+struct ChatMessageText: View {
+    let content: String
+    var body: some View {
+        Text(ChatMarkdown.render(content))
+            .tint(.accentColor)
+            .textSelection(.enabled)
+            .environment(\.openURL, OpenURLAction { url in
+                ChatMarkdown.safeURL(url) ? .systemAction : .discarded
+            })
+    }
+}
+
 struct Settings: Codable {
     var imageEnabled: Bool?; var imageBaseURL: String?; var imageModel: String?
     var mode: String; var provider: String; var baseURL: String; var model: String
@@ -546,7 +588,7 @@ struct MainView: View {
                                         VStack(alignment: .leading, spacing: 6) {
                                             Text(message.role == "user" ? "Ты" : "Помощник").font(.caption.bold()).foregroundStyle(.secondary)
                                             if message.role == "user" { Button("Изменить") { model.editMessage(index,message.content) }.font(.caption).disabled(model.running) }
-                                            Text(message.content.isEmpty && message.streaming == true ? "…" : message.content)
+                                            ChatMessageText(content: message.content.isEmpty && message.streaming == true ? "…" : message.content)
                                                 .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                                         }.padding(14).background(message.role == "user" ? Color.primary.opacity(0.08) : Color.secondary.opacity(0.06))
                                             .clipShape(RoundedRectangle(cornerRadius: 10)).id(index)
