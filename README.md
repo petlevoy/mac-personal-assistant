@@ -96,3 +96,12 @@ Cloud generation is blocked while offline, including previously granted tool per
 The image is stored in the project and exposed as an artifact with preview/open/save controls.
 The generator key is distinct from the chat key, never serialized in backend state.
 Automated provider tests use a mock; live paid generation is not yet verified. Native smoke tests use isolated temporary application data. The Apple Silicon distribution is ad-hoc signed, not Apple-notarized.
+
+## Chat UX in 0.3.6
+
+- Chat messages render headings, fenced code with a copy button, block quotes, simple pipe tables and lists, in addition to inline bold/italic and safe web links. Raw HTML remains text. This is a compact Markdown subset, not a full GFM renderer (escaped pipes and multiline table cells are not supported).
+- Unsent drafts are saved locally per project/chat and restored when returning to that chat or restarting the app. Sending clears only the submitted, unchanged draft; an in-flight attachment stays with the originating chat. Drafts use app preferences and are not included in the backend project backup.
+- Search filters the current chat by case-insensitive message text; clear the field to show all messages. «Цитировать» inserts a Markdown quote into the composer.
+- Drag local files from Finder into the composer to use the same extraction/import path as the paperclip (12 MB limit). This imports text/OCR, not general multimodal image understanding.
+- «Аа» persists the text size for messages and the composer. The printer button opens the native print dialog for the full chat; choose PDF → Save as PDF to export. Printing includes text, headings, code and textual table rows, not image attachments.
+- The 0.3.5 fix allowing incomplete image-generator settings to be saved is preserved.

@@ -175,6 +175,20 @@ import Foundation
         model.chatID = "smoke-alternate-chat"
         try require(model.draft == "Draft B", "native alternate chat retains draft")
         model.draft = ""; model.projectID = pid; model.chatID = cid; model.draft = originalDraft
+        let attachmentURL = FileManager.default.temporaryDirectory.appendingPathComponent("Inij-drop-" + UUID().uuidString + ".txt")
+        try "Содержимое перетаскиваемого файла".write(to:attachmentURL,atomically:true,encoding:.utf8)
+        defer { try? FileManager.default.removeItem(at:attachmentURL) }
+        let pasteboard = NSPasteboard.withUniqueName()
+        pasteboard.writeObjects([attachmentURL as NSURL])
+        try require(Composer.Input.fileURLs(pasteboard) == [attachmentURL], "native file drop decodes local Finder URL")
+        pasteboard.releaseGlobally()
+        model.attach(attachmentURL)
+        for _ in 0..<30 {
+            if model.draft.contains("Содержимое перетаскиваемого файла") { break }
+            try await Task.sleep(nanoseconds:100_000_000)
+        }
+        try require(model.draft.contains("Содержимое перетаскиваемого файла"), "dropped-file import path extracts text into current draft")
+        model.draft = originalDraft
         let transcript = ChatTranscript.textView(title:"Проверка PDF",messages:[ChatMessage(role:"assistant",content:markdownFixture)],size:14)
         let pdf = transcript.dataWithPDF(inside:transcript.bounds)
         try require(pdf.starts(with:Data("%PDF".utf8)) && pdf.count > 500, "chat transcript renders an actual PDF")
