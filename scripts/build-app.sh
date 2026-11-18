@@ -70,11 +70,11 @@ stage="$PWD/build/dmg-stage"
 mkdir -p "$stage"
 ditto "$app" "$stage/Inij.app"
 [[ -L "$stage/Applications" ]] || ln -s /Applications "$stage/Applications"
-hdiutil create -volname 'Inij' -srcfolder "$stage" -ov -format UDZO "$PWD/dist/Inij-0.3.6-arm64.dmg"
+hdiutil create -volname 'Inij' -srcfolder "$stage" -ov -format UDZO "$PWD/dist/Inij-0.3.7-arm64.dmg"
 if [[ -n "${NOTARY_PROFILE:-}" ]]; then
-  xcrun notarytool submit "$PWD/dist/Inij-0.3.6-arm64.dmg" --keychain-profile "$NOTARY_PROFILE" --wait
-  xcrun stapler staple "$PWD/dist/Inij-0.3.6-arm64.dmg"
+  xcrun notarytool submit "$PWD/dist/Inij-0.3.7-arm64.dmg" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple "$PWD/dist/Inij-0.3.7-arm64.dmg"
 fi
-"$python_bin" -I -B scripts/verify_installer.py "$PWD/dist/Inij-0.3.6-arm64.dmg" "$PWD/build/installed-smoke.json"
-shasum -a 256 "$PWD/dist/Inij-0.3.6-arm64.dmg"
+"$python_bin" -I -B scripts/verify_installer.py "$PWD/dist/Inij-0.3.7-arm64.dmg" "$PWD/build/installed-smoke.json"
+shasum -a 256 "$PWD/dist/Inij-0.3.7-arm64.dmg"
 echo 'Release built; packaged/installed LaunchServices smoke and post-launch signatures passed. Ad-hoc build is not notarized.'

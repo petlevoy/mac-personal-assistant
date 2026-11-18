@@ -709,7 +709,7 @@ struct MainView: View {
                     }
                 }
                 HStack {
-                    Button(action: { model.settingsShown=true }) { Image(systemName:"gearshape").font(.title3) }.help("Настройки")
+                    Button(action: { model.settingsShown=true }) { Image(systemName:"gearshape").font(.title3) }.help("Настройки").accessibilityIdentifier("settings.open").smokeControl("settings.open")
                     Button(action: model.newChat) { Text("Новый чат").frame(maxWidth:.infinity).padding(.vertical,6) }.disabled(model.running)
                 }
             }.buttonStyle(MonochromeButton()).controlSize(.regular).padding(12).frame(width:220)
@@ -717,6 +717,11 @@ struct MainView: View {
             HSplitView {
                 VStack(spacing: 0) {
                     HStack {
+                        Button { model.showBrowser.toggle() } label: {
+                            Label(model.showBrowser ? "Скрыть браузер" : "Браузер", systemImage: "globe")
+                        }
+                        .help(model.showBrowser ? "Скрыть встроенный браузер" : "Показать встроенный браузер")
+                        .accessibilityIdentifier("browser.toggle").smokeControl("browser.toggle")
                         Spacer()
                         Text(telemetryLabel).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                             .help("Температуры датчиков, если доступны. Токены — только usage провайдера за запуск; н/д, если не возвращены. Трафик — полезные байты запросов/ответов внешнего API модели, без браузера, загрузок и протокольных накладных расходов.")
@@ -804,7 +809,7 @@ struct MainView: View {
                     }.padding(12)
                 }.frame(minWidth: 480, maxWidth: .infinity)
                 if model.showBrowser {
-                    BrowserPanel(browser: model.browser).frame(minWidth: 350,idealWidth: 500)
+                    BrowserPanel(browser: model.browser, close: { model.showBrowser = false }).frame(minWidth: 350,idealWidth: 500)
                 }
             }
         }
@@ -877,8 +882,16 @@ struct MainView: View {
 }
 struct BrowserPanel: View {
     @ObservedObject var browser: Browser
+    var close: () -> Void
     var body: some View {
         VStack(spacing: 6) {
+            HStack {
+                Text("Браузер").font(.headline)
+                Spacer()
+                Button(action: close) { Label("Закрыть", systemImage: "xmark") }
+                    .help("Закрыть панель браузера")
+                    .accessibilityIdentifier("browser.close").smokeControl("browser.close")
+            }.padding(.horizontal, 8).padding(.top, 8)
             HStack {
                 TextField("https://…",text: $browser.address).onSubmit { go() }
                 Button("Открыть",action: go).disabled(!browser.enabled)
@@ -925,11 +938,17 @@ struct SettingsView: View {
     @State var prompt = ""
     var body: some View {
         VStack(alignment: .leading,spacing: 12) {
-            Text("Настройки").font(.title)
+            HStack {
+                Text("Настройки").font(.title)
+                Spacer()
+                Button { model.settingsShown = false } label: { Label("Закрыть", systemImage: "xmark") }
+                    .help("Закрыть без сохранения изменений формы")
+                    .accessibilityIdentifier("settings.close").smokeControl("settings.close")
+            }
             Picker("Оформление", selection: $appearanceTheme) {
                 Text("Тёмное").tag("dark")
                 Text("Светлое").tag("light")
-            }.pickerStyle(.segmented).help("Сохраняется автоматически и применяется ко всему приложению")
+            }.pickerStyle(.segmented).help("Сохраняется автоматически и применяется ко всему приложению").disabled(model.running)
             VStack(spacing:8) {
                 HStack {
                     ForEach(Array(["Модель","Промпты","Скиллы и память","MCP","Экспорт и бэкап","Explore · модели","Дополнительно"].enumerated()),id: \.offset) { index,title in
@@ -958,7 +977,7 @@ struct SettingsView: View {
                         if !models.isEmpty { Picker("Доступные модели",selection: $selectedModel) { ForEach(models,id: \.self) { Text($0).tag($0) } } }
                         Button("Проверить список моделей") { save(fetch: true) }
                     }
-                    Toggle("Разрешить инструменты модели",isOn: $toolsEnabled)
+                    Toggle("Разрешить инструменты модели",isOn: $toolsEnabled).accessibilityIdentifier("settings.tools").smokeControl("settings.tools", value: toolsEnabled ? "on" : "off")
                     Text("Для действий нужна модель с поддержкой tool calling. Если она не поддерживается, выключи инструменты для обычного чата.").font(.caption).foregroundStyle(.secondary)
                     TextField("Лимит контекста",value: $limit,format: .number)
                     Slider(value: $temperature,in: 0...2) { Text("Температура \(temperature, specifier: "%.1f")") }
@@ -1051,15 +1070,23 @@ struct SettingsView: View {
                     }.padding()
                 } }.frame(maxHeight:.infinity)
             }
+            .disabled(model.running)
+            if model.running { Text("Модель работает. Настройки можно закрыть без сохранения — ответ продолжит генерироваться.").font(.caption).foregroundStyle(.secondary) }
             if !model.error.isEmpty { Text(model.error).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
-            HStack { Button("Сохранить и закрыть") { save(fetch:false, close:true) }; Spacer(); Button("Сохранить",action: { save(fetch: false) }).disabled(model.running) }
+            HStack {
+                Button("Закрыть без сохранения") { model.settingsShown = false }
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("settings.cancel").smokeControl("settings.cancel")
+                Spacer()
+                Button("Сохранить",action: { save(fetch: false) }).disabled(model.running)
+                Button("Сохранить и закрыть") { save(fetch:false, close:true) }.disabled(model.running)
+            }
         }.padding(24).frame(width: 1000,height: 720).modifier(AppTheme()).tint(.gray).accentColor(.gray).buttonStyle(MonochromeButton()).interactiveDismissDisabled()
         .onAppear {
             if let s = model.snapshot?.settings { imageEnabled=s.imageEnabled ?? false; imageBase=s.imageBaseURL ?? ""; imageModel=s.imageModel ?? ""; thermalEnabled=s.thermalEnabled ?? false; thermalLimit=s.thermalLimit ?? 80; mode=s.mode; provider=s.provider; base=s.baseURL; selectedModel=s.model; limit=s.contextLimit; temperature=s.temperature; toolsEnabled=s.toolsEnabled;searchProvider=s.searchProvider ?? "brave" }
             imageKey=Keys.get("image"); modelKey=Keys.get("model"); braveKey=Keys.get("brave");tavilyKey=Keys.get("tavily");serperKey=Keys.get("serper")
             profileID=model.chat?.profileID ?? model.snapshot?.profiles.first?.id ?? ""; loadProfile(profileID)
         }
-        .disabled(model.running)
     }
     func loadProfile(_ id: String) {
         if id.isEmpty { profileName=""; prompt="" }
@@ -1070,6 +1097,7 @@ struct SettingsView: View {
         if panel.runModal() == .OK, let url=panel.url { selectedModel=url.path; provider="local"; if mode == "cloud" { mode="offline" }; save(fetch:false,load:true) }
     }
     func save(fetch: Bool, load: Bool = false, close: Bool = false) {
+        guard !model.running else { return }
         model.error = ""
         model.perform {
             _ = try await model.api("/settings", ["imageEnabled":imageEnabled,"imageBaseURL":imageBase,"imageModel":imageModel,"thermalEnabled":thermalEnabled,"thermalLimit":thermalLimit,"mode":mode,"provider":provider,"baseURL":base,"model":selectedModel,"contextLimit":limit,"temperature":temperature,"toolsEnabled":toolsEnabled,"searchProvider":searchProvider])

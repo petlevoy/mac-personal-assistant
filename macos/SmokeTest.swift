@@ -2,12 +2,45 @@ import AppKit
 import SwiftUI
 import Foundation
 
+// Geometry anchors exist only in the isolated smoke launch. Events still pass through
+// the real NSWindow hit-testing and SwiftUI button/checkbox dispatch, never actions directly.
+@MainActor final class SmokeControlView: NSView {
+    static let controls = NSMapTable<NSString, SmokeControlView>(keyOptions: .strongMemory, valueOptions: .weakMemory)
+    var testValue = ""
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+struct SmokeControlAnchor: NSViewRepresentable {
+    var identifier: String
+    var value: String
+    func makeNSView(context: Context) -> SmokeControlView { SmokeControlView(frame: .zero) }
+    func updateNSView(_ view: SmokeControlView, context: Context) {
+        view.testValue = value
+        SmokeControlView.controls.setObject(view, forKey: identifier as NSString)
+    }
+}
+extension View {
+    @ViewBuilder func smokeControl(_ identifier: String, value: String = "") -> some View {
+        if CommandLine.arguments.contains("--smoke-test") {
+            self.background(SmokeControlAnchor(identifier: identifier, value: value))
+        } else { self }
+    }
+}
+
 @MainActor func runNativeSmoke(model: AppModel, delegate: AppDelegate, reportPath: String) async {
     var checks: [String] = []
     var report: [String: Any] = [:]
     func require(_ condition: Bool, _ name: String) throws {
         guard condition else { throw AppError(message: "Smoke check failed: " + name) }
         checks.append(name)
+    }
+    // Render our own app view; no desktop Screen Recording entitlement is needed.
+    func capture(_ suffix: String, _ target: NSWindow) throws {
+        guard let view = target.contentView else { throw AppError(message: "Window content absent") }
+        view.layoutSubtreeIfNeeded()
+        guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { throw AppError(message: "Window bitmap unavailable") }
+        view.cacheDisplay(in: view.bounds, to: bitmap)
+        guard let data = bitmap.representation(using: .png, properties: [:]) else { throw AppError(message: "Window PNG unavailable") }
+        try data.write(to: URL(fileURLWithPath: reportPath + "-" + suffix + ".png"))
     }
     do {
         try require(model.port > 0 && model.snapshot != nil && model.error.isEmpty, "native app launched embedded backend and decoded state")
@@ -112,13 +145,6 @@ import Foundation
         model.settingsShown = false
         model.polling?.cancel()
         if !CommandLine.arguments.contains("--skip-capture") {
-        func capture(_ suffix:String, _ target:NSWindow) throws {
-            let capture=Process(); capture.executableURL=URL(fileURLWithPath:"/usr/sbin/screencapture")
-            capture.arguments=["-x","-l",String(target.windowNumber),reportPath+"-"+suffix+".png"]
-            try capture.run(); capture.waitUntilExit()
-            guard capture.terminationStatus == 0 else { throw AppError(message:"Window screenshot failed") }
-
-        }
         model.snapshot?.settings.model="/Models/Very-Long-Model-Repository/Qwen3-27B-Turbo-Fusion-Example-Uncensored-Coder-MAX-Q4_K_M.gguf"
         window.setContentSize(NSSize(width:900,height:650))
         try await Task.sleep(nanoseconds:500_000_000)
@@ -268,8 +294,98 @@ import Foundation
         } catch let error as AppError {
             try require(error.message.contains("устарела"), "WebKit rejects stale reference")
         }
+        // Exercise the actual SwiftUI controls with hit-tested mouse events, not the model closure.
+        func clickControl(_ identifier: String, in target: NSWindow? = nil) async throws {
+            let window = target ?? window
+            window.contentView?.layoutSubtreeIfNeeded()
+            guard let root = window.contentView, let anchor = SmokeControlView.controls.object(forKey: identifier as NSString), anchor.window === window else {
+                throw AppError(message: "Control not mounted in the expected window: " + identifier)
+            }
+            let rect = anchor.convert(anchor.bounds, to: nil)
+            try require(rect.width > 10 && rect.height > 10, identifier + " has a visible click target")
+            let point = NSPoint(x: identifier == "settings.tools" ? rect.maxX - 8 : rect.midX, y: rect.midY)
+            guard let hit = root.hitTest(root.convert(point, from: nil)), !hit.isHidden else {
+                throw AppError(message: "Control is not hit-testable: " + identifier)
+            }
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            try await Task.sleep(nanoseconds: 200_000_000)
+            guard let down = NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1),
+                  let up = NSEvent.mouseEvent(with: .leftMouseUp, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime + 0.05, windowNumber: window.windowNumber, context: nil, eventNumber: 2, clickCount: 1, pressure: 0) else {
+                throw AppError(message: "Cannot create control mouse events")
+            }
+            // sendEvent routes through the window's real hit test. Queue the matching
+            // mouse-up first so AppKit's synchronous button tracking can consume it.
+            NSApp.postEvent(up, atStart: true)
+            window.sendEvent(down)
+            window.sendEvent(up)
+            var trace = report["mouse_events"] as? [String] ?? []
+            trace.append(identifier + " " + NSStringFromRect(rect) + " hit=" + String(describing: type(of: hit)))
+            report["mouse_events"] = trace
+            try await Task.sleep(nanoseconds: 500_000_000)
+        }
+        model.showBrowser = false
+        try await Task.sleep(nanoseconds: 400_000_000)
+        try await clickControl("browser.toggle")
+        try require(model.showBrowser && model.browser.webView.window === window, "mouse click opens embedded browser")
+        // Closing is also available offline; it only hides the panel and preserves its page.
+        model.browser.enabled = false
+        if !CommandLine.arguments.contains("--skip-capture") {
+            try capture("browser-open", window)
+            checks.append("browser close control view rendered")
+        }
+        try await clickControl("browser.close")
+        try require(!model.showBrowser && model.browser.webView.window == nil, "mouse click on Close removes browser panel even offline")
+        try require(window.isVisible && model.port > 0, "closing browser leaves chat window and backend running")
+        try await clickControl("browser.toggle")
+        try require(model.showBrowser && model.browser.webView.window === window, "mouse click reopens browser without settings")
+        let retained = try await model.browser.webView.evaluateJavaScript("document.querySelector('input').value") as? String
+        try require(retained == "hello", "browser page and entered text survive close and reopen")
+        try await clickControl("browser.toggle")
+        try require(!model.showBrowser, "toolbar mouse click can also hide browser")
         model.browser.allow(false)
         try require(!model.browser.enabled, "offline mode disables browser")
+        if let flag = CommandLine.arguments.firstIndex(of: "--settings-busy-smoke-base"), CommandLine.arguments.count > flag + 1 {
+            let base = CommandLine.arguments[flag + 1]
+            _ = try await model.api("/settings", ["mode":"cloud", "provider":"openai", "baseURL":base, "model":"settings-stream-fixture", "toolsEnabled":false])
+            try await model.refresh()
+            let initialSettings = try JSONSerialization.data(withJSONObject: (try await model.api("/state"))["settings"] ?? [:], options: .sortedKeys)
+            try await clickControl("settings.open")
+            guard let idleSheet = window.sheets.first else { throw AppError(message: "Settings did not open for cancel test") }
+            // This checkbox is a local draft. Dismissing must not call save or alter the backend.
+            try await clickControl("settings.tools", in: idleSheet)
+            let draftValue = SmokeControlView.controls.object(forKey: "settings.tools")?.testValue
+            try require(draftValue == "on", "mouse edits tools checkbox in unsaved settings draft")
+            try await clickControl("settings.close", in: idleSheet)
+            try require(!model.settingsShown && window.sheets.isEmpty, "settings top Close responds to mouse and dismisses unsaved edits")
+            let cancelledSettings = try JSONSerialization.data(withJSONObject: (try await model.api("/state"))["settings"] ?? [:], options: .sortedKeys)
+            try require(initialSettings == cancelledSettings, "cancelled settings draft does not change saved backend parameters")
+            model.draft = "Continue streaming while I open and close settings"
+            model.send()
+            for _ in 0..<40 {
+                try await Task.sleep(nanoseconds:100_000_000)
+                try await model.refresh()
+                if model.running && !(model.chat?.messages.last?.content.isEmpty ?? true) { break }
+            }
+            guard let active = model.snapshot?.jobs.first(where: { $0.status == "running" }) else { throw AppError(message: "Streaming fixture did not start") }
+            try require(model.running, "real backend streaming job is running before settings close")
+            try await clickControl("settings.open")
+            guard let busySheet = window.sheets.first else { throw AppError(message: "Settings did not open during generation") }
+            if !CommandLine.arguments.contains("--skip-capture") { try capture("settings-busy", busySheet) }
+            try await clickControl("settings.cancel", in: busySheet)
+            try await model.refresh()
+            try require(!model.settingsShown && window.sheets.isEmpty, "mouse closes settings without saving while generation is active")
+            try require(model.snapshot?.jobs.first(where: { $0.id == active.id })?.status == "running", "closing settings does not stop the running generation")
+            let busySettings = try JSONSerialization.data(withJSONObject: (try await model.api("/state"))["settings"] ?? [:], options: .sortedKeys)
+            try require(initialSettings == busySettings, "closing busy settings leaves saved parameters unchanged")
+            for _ in 0..<160 {
+                try await Task.sleep(nanoseconds:100_000_000)
+                try await model.refresh()
+                if !model.running { break }
+            }
+            try require(model.snapshot?.jobs.first(where: { $0.id == active.id })?.status == "done", "same generation completes after settings dismissal")
+            try require(model.chat?.messages.last?.content.contains("STREAM_COMPLETED") == true, "remaining streaming response reaches chat after closing settings")
+        }
         report["status"] = "passed"
     } catch { report["status"] = "failed"; report["error"] = error.localizedDescription }
     report["checks"] = checks
@@ -278,5 +394,9 @@ import Foundation
     if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) {
         try? data.write(to: URL(fileURLWithPath: reportPath))
     }
+    model.settingsShown = false
+    model.exploreShown = false
+    for window in NSApp.windows { for sheet in window.sheets { window.endSheet(sheet) } }
+    try? await Task.sleep(nanoseconds: 200_000_000)
     NSApp.terminate(nil)
 }
