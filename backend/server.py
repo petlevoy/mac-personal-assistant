@@ -76,6 +76,7 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path=='/context':
                 m=s.prepare_messages(data['projectID'],data['chatID'])
                 return self.send_json({'estimatedTokens':context_size(m,s.data['settings']),'method':'UTF-8 bytes / 4; approximate','messages':m})
+            elif self.path=='/image/generate': return self.send_json({'id':s.start_image(data['projectID'],data['chatID'],data['text'])})
             elif self.path=='/send': return self.send_json({'id':s.start(data['projectID'],data['chatID'],data['text'])})
             elif self.path=='/compact': return self.send_json({'id':s.start(data['projectID'],data['chatID'],'',True)})
             elif self.path=='/stop': s.stop()

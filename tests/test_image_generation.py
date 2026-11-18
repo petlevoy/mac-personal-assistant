@@ -9,7 +9,7 @@ class ImageTests(unittest.TestCase):
         self.store=Store(pathlib.Path(self.temp.name)/'data')
         self.pid=self.store.data['projects'][0]['id']
         self.job={'projectID':self.pid,'stop':threading.Event()}
-        self.settings={**self.store.data['settings'],'mode':'internet','imageEnabled':True,'imageBaseURL':'https://example.com/v1','imageModel':'gpt-image-test'}
+        self.settings={**self.store.data['settings'],'mode':'internet','imageEnabled':True,'imageProvider':'cloud','imageBaseURL':'https://example.com/v1','imageModel':'gpt-image-test'}
         self.store.await_action=lambda *args: {'approved':True}
     def test_independent_key_attachment_and_persistence(self):
         self.store.secrets={'image':'image-secret','model':'chat-secret'}

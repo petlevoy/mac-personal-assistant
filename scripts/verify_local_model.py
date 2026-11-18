@@ -29,6 +29,23 @@ with tempfile.TemporaryDirectory() as folder:
   call=res['choices'][0]['message']['tool_calls'][0];assert call['function']['name']=='list_files',res
   result=s.execute({'id':'smoke','projectID':pid,'stop':threading.Event()},'list_files',json.loads(call['function']['arguments']),s.data['settings'])
   assert result is not None;checks.append('real GGUF emits tool call and project list_files executes')
+  if len(sys.argv)>2:
+   image_model=str(pathlib.Path(sys.argv[2]).resolve())
+   previous=s.local.process
+   s.update_settings({'imageEnabled':True,'imageProvider':'local','imageLocalModel':image_model,'imageWidth':256,'imageHeight':256,'imageSteps':1,'imageCFG':1})
+   jid=s.start_image(pid,cid,'a red apple on a table')
+   deadline=time.monotonic()+180
+   while s.jobs[jid]['status']=='running' and time.monotonic()<deadline:time.sleep(.2)
+   assert s.jobs[jid]['status']=='done',s.jobs[jid]
+   assert previous.poll() is not None and s.local.process is None
+   checks.append('real image job unloads only its owned text engine')
+   assert any(m.get('name')=='generate_image' for m in s.chat(pid,cid)['messages'])
+   jid=s.start(pid,cid,'Say done in one short sentence. /no_think')
+   deadline=time.monotonic()+180
+   while s.jobs[jid]['status']=='running' and time.monotonic()<deadline:time.sleep(.2)
+   assert s.jobs[jid]['status']=='done',s.jobs[jid]
+   assert s.local.process is not None and s.local.process.pid != previous.pid
+   checks.append('text model automatically reloads after image and accepts persisted tool history')
   s.save();again=Store(folder);assert again.data['profiles'][0]['prompt']=='Answer briefly. /no_think';again.local.close();checks.append('system prompt survives Store restart')
   print(json.dumps({'status':'passed','checks':checks,'model':d['file'],'bytes':d['bytes'],'chat':s.chat(pid,cid)['messages'][-1]['content']},ensure_ascii=False,indent=2),flush=True)
  finally:s.stop();s.local.close()

@@ -121,7 +121,7 @@ def offline_shell_available():
 
 def available_tools(settings):
     return [t for t in TOOLS if settings['mode'] != 'offline' or (
-        t['function']['name'] not in NETWORK_TOOLS and
+        (t['function']['name'] not in NETWORK_TOOLS or (t['function']['name']=='generate_image' and settings.get('imageProvider')=='local' and settings.get('imageEnabled'))) and
         (t['function']['name'] != 'run_command' or offline_shell_available()))]
 
 def context_size(messages, settings):
@@ -136,7 +136,7 @@ def tool(name, description, properties, required=()):
       'parameters':{'type':'object','properties':properties,'required':list(required),'additionalProperties':False}}}
 S={'type':'string'}
 TOOLS=[
- tool('generate_image','Generate an image using the separately configured image model and attach it to this chat. Requires internet and user approval.',{'prompt':S},['prompt']),
+ tool('generate_image','Generate an image using the separately configured image model and attach it to this chat. Uses the separately selected local engine (also offline) or cloud Images API. Local SD images do not use the text GGUF engine. User approval required.',{'prompt':S},['prompt']),
  tool('attach_file','Attach an existing project file to this chat as an openable/saveable file card. Use when user asks to send/show a file here; no external upload.',{'path':S},['path']),
  tool('create_office','Create a new DOCX, XLSX or PPTX file, without a template. content is a JSON string: DOCX {title,paragraphs:[text],tables:[[[cell]]]}, XLSX {sheets:[{name,rows:[[cell]]}]}, PPTX {slides:[{title,body:[text]}]}. User approval required. Never invent source facts.',{'output':S,'content':S},['output','content']),
  tool('list_files','List files inside the project workspace',{'path':S}),
@@ -186,6 +186,13 @@ class Store(Features):
             for c in p['chats']:
                 for m in c['messages']:
                     if m.pop('streaming',False): m['content'] += '\n[Ответ прерван закрытием приложения]'
+                pending_calls={}
+                for m in c['messages']:
+                    for call in m.get('tool_calls',[]): pending_calls[call['id']]=call['function']['name']
+                    if m.get('role')=='tool': pending_calls.pop(m.get('tool_call_id'),None)
+                for callid,name in pending_calls.items():
+                    c['messages'].append({'role':'tool','tool_call_id':callid,'name':name,'content':json.dumps({'error':'Выполнение прервано закрытием приложения; результат не подтверждён.'},ensure_ascii=False)})
+        self.data['settings'].setdefault('imageProvider','cloud' if self.data['settings'].get('imageEnabled') or self.data['settings'].get('imageBaseURL') else 'local')
         self.data['settings'].setdefault('thermalEnabled',False)
         self.data['settings'].setdefault('thermalLimit',80)
         self.usage={'inputTokens':0,'outputTokens':0,'reportedRequests':0,'missingRequests':0,'sentBytes':0,'receivedBytes':0}
@@ -232,7 +239,7 @@ class Store(Features):
             result['hasBraveKey']=bool(self.secrets.get('brave')); result['hasModelKey']=bool(self.secrets.get('model'))
             return result
     def update_settings(self,settings):
-        allowed={'imageEnabled','imageBaseURL','imageModel','mode','provider','baseURL','model','contextLimit','temperature','toolsEnabled','searchProvider','thermalEnabled','thermalLimit'}
+        allowed={'imageProvider','imageLocalModel','imageWidth','imageHeight','imageSteps','imageCFG','imageCompute','imageEnabled','imageBaseURL','imageModel','mode','provider','baseURL','model','contextLimit','temperature','toolsEnabled','searchProvider','thermalEnabled','thermalLimit'}
         if any(j['status']=='running' for j in self.jobs.values()): raise ValueError('Сначала останови генерацию')
         with self.lock:
             new={**self.data['settings'],**{k:v for k,v in settings.items() if k in allowed}}
@@ -240,6 +247,14 @@ class Store(Features):
             elif new['mode']=='cloud': raise ValueError('Для встроенной модели выбери локальный режим')
             # Image configuration may be saved as a draft. Validate at generation time.
             new['imageEnabled']=bool(new.get('imageEnabled',False))
+            if new.get('imageProvider','cloud') not in ('local','cloud'): raise ValueError('Неизвестный генератор изображений')
+            if new.get('imageCompute','auto') not in ('auto','cpu'): raise ValueError('Неизвестный режим вычислений')
+            for field in ('imageWidth','imageHeight'):
+                new[field]=int(new.get(field,512))
+                if new[field] not in (256,512,768,1024): raise ValueError('Размер изображения: 256, 512, 768 или 1024')
+            new['imageSteps']=int(new.get('imageSteps',20)); new['imageCFG']=float(new.get('imageCFG',7))
+            if not 1<=new['imageSteps']<=50 or not 1<=new['imageCFG']<=15: raise ValueError('Шаги: 1–50; CFG: 1–15')
+            new['imageLocalModel']=str(new.get('imageLocalModel',''))
             new['contextLimit']=max(1024,min(int(new['contextLimit']),131072))
             new['temperature']=max(0,min(float(new['temperature']),2))
             if new.get('searchProvider','brave') not in ('brave','tavily','serper'): raise ValueError('Неизвестный поиск')
@@ -268,6 +283,8 @@ class Store(Features):
         for skill in p['skills']:
             if skill['id'] in c['skillIDs']: system+='\n\nПодключенный скилл '+skill['name']+' (skillID='+skill['id']+', используй read_skill_file для ссылок):\n'+skill['text']
         settings=self.data['settings']
+        if settings.get('imageEnabled'):
+            system+='\nВ приложении есть generate_image. Генератор изображений независим от текстовой модели: '+('встроенный локальный Stable Diffusion, доступен без интернета.' if settings.get('imageProvider')=='local' else 'отдельный облачный Images API, требует интернета.')
         if settings.get('toolsEnabled',True):
             system+='\nИнструменты включены. Если пользователь просит выполнить команду или скрипт, вызови run_command и проверь exitCode/output. Не заменяй выполнение инструкцией для пользователя и не заявляй, что умеешь только писать файлы. Не сообщай об успехе без результата инструмента.'
             if settings['mode']=='offline':
@@ -298,6 +315,39 @@ class Store(Features):
             self.jobs={jid:j}; self.save()
             threading.Thread(target=self.run,args=(jid,copy.deepcopy(s),messages),daemon=True).start()
             return jid
+    def start_image(self,pid,cid,text):
+        with self.lock:
+            self.idle()
+            if not text.strip() or len(text)>16000: raise ValueError('Нужен запрос длиной до 16000 символов')
+            settings=copy.deepcopy(self.data['settings'])
+            if not settings.get('imageEnabled'): raise ValueError('Включи генератор изображений в настройках')
+            if settings.get('imageProvider')!='local': raise ValueError('Кнопка «Нарисовать» использует только локальный генератор. Выбери «На этом Mac» в настройках.')
+            from local_images import model_file
+            model_file(settings.get('imageLocalModel',''))
+            chat=self.chat(pid,cid); chat['messages'].append({'role':'user','content':text})
+            if chat['title']=='Новый чат': chat['title']=text[:50]
+            jid=uid(); job={'id':jid,'projectID':pid,'chatID':cid,'status':'running','error':'','stop':threading.Event(),'directImage':True}
+            self.jobs={jid:job}; self.save()
+            threading.Thread(target=self.run_image,args=(job,text,settings),daemon=True).start()
+            return jid
+    def run_image(self,job,text,settings):
+        # A regular tool-call pair keeps later chat requests valid for all providers.
+        callid=uid(); status='done'
+        call={'id':callid,'type':'function','function':{'name':'generate_image','arguments':json.dumps({'prompt':text},ensure_ascii=False)}}
+        with self.lock:
+            self.chat(job['projectID'],job['chatID'])['messages'].append({'role':'assistant','content':'','tool_calls':[call]}); self.save()
+        try:
+            result=self.execute(job,'generate_image',{'prompt':text},settings)
+        except Exception as error:
+            status='stopped' if job['stop'].is_set() or isinstance(error,InterruptedError) else 'failed'
+            job['error']='Остановлено' if status=='stopped' else str(error)[:600]
+            result={'error':job['error']}
+        finally:
+            with self.lock:
+                chat=self.chat(job['projectID'],job['chatID'])
+                chat['messages'].append({'role':'tool','name':'generate_image','tool_call_id':callid,'content':json.dumps(result,ensure_ascii=False)})
+                if status!='done': chat['messages'].append({'role':'assistant','content':job['error']})
+                job['status']=status; self.save()
     def stop(self):
         with self.lock:
             for j in self.jobs.values():
@@ -356,7 +406,7 @@ class Store(Features):
     def execute(self,j,name,args,s):
         pid=j['projectID']; p=self.project(pid); root=p['workspace']
         if name not in [t['function']['name'] for t in TOOLS]: raise ValueError('Неизвестный инструмент')
-        if s['mode']=='offline' and (name in NETWORK_TOOLS or (name=='run_command' and not offline_shell_available())): raise ValueError('Интернет отключен; защищённый офлайн-запуск команд на этой системе недоступен')
+        if s['mode']=='offline' and ((name in NETWORK_TOOLS and not (name=='generate_image' and s.get('imageProvider')=='local')) or (name=='run_command' and not offline_shell_available())): raise ValueError('Интернет отключен; защищённый офлайн-запуск команд на этой системе недоступен')
         self.log(pid,'Инструмент',name)
         if name=='generate_image':
             from image_generation import generate

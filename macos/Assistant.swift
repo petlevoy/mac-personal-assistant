@@ -171,6 +171,8 @@ enum ChatTranscript {
 
 struct Settings: Codable {
     var imageEnabled: Bool?; var imageBaseURL: String?; var imageModel: String?
+    var imageProvider: String?; var imageLocalModel: String?; var imageCompute: String?
+    var imageWidth: Int?; var imageHeight: Int?; var imageSteps: Int?; var imageCFG: Double?
     var mode: String; var provider: String; var baseURL: String; var model: String
     var thermalEnabled: Bool?; var thermalLimit: Double?
     var contextLimit: Int; var temperature: Double; var toolsEnabled: Bool; var searchProvider: String?
@@ -194,6 +196,7 @@ struct Project: Codable, Identifiable {
     var skills: [Skill]; var chats: [Chat]; var log: [LogEntry]
 }
 struct Job: Codable, Identifiable {
+    var detail: String?
     var id: String; var projectID: String; var chatID: String; var status: String; var error: String; var newChatID: String?
 }
 struct Pending: Codable, Identifiable {
@@ -470,6 +473,10 @@ struct BrowserView: NSViewRepresentable {
         let text = draft; let pid = projectID; let cid = chatID
         perform { _ = try await self.api("/send", ["projectID": pid, "chatID": cid, "text": text]); if self.projectID == pid && self.chatID == cid && self.draft == text { self.draft = "" } else if self.draftStore.read(pid,cid) == text { self.draftStore.write("",pid,cid) } }
     }
+    func drawImage() {
+        let text = draft; let pid = projectID; let cid = chatID
+        perform { _ = try await self.api("/image/generate", ["projectID":pid,"chatID":cid,"text":text]); if self.projectID == pid && self.chatID == cid && self.draft == text { self.draft = "" } }
+    }
     func stop() { perform { _ = try await self.api("/stop", [:]); self.browser.webView.stopLoading(); self.browser.finish(AppError(message: "Остановлено")) } }
     func newChat() { perform { let r = try await self.api("/chat", ["projectID": self.projectID]); self.chatID = r["id"] as? String ?? "" } }
     func newProject() {
@@ -735,7 +742,7 @@ struct MainView: View {
                         }.padding(.horizontal,12).padding(.vertical,6)
                     }
                     if !model.startup.isEmpty { Text(model.startup).padding(); Button("Повторить запуск") { Task { await model.start() } } }
-                    if model.snapshot?.settings.model.isEmpty == true { Text("Выбери файл GGUF в настройках или скачай модель в Explore.").padding(); Button("Настроить модель") { model.settingsShown = true } }
+                    if model.snapshot?.settings.model.isEmpty == true && !(model.snapshot?.settings.imageEnabled == true && model.snapshot?.settings.imageProvider == "local" && !(model.snapshot?.settings.imageLocalModel ?? "").isEmpty) { Text("Для текстового чата выбери файл GGUF в настройках или скачай модель в Explore.").padding(); Button("Настроить модель") { model.settingsShown = true } }
                     chatToolbar
                     ScrollViewReader { proxy in
                         ScrollView {
@@ -792,11 +799,18 @@ struct MainView: View {
                         }.padding().background(Color.primary.opacity(0.12))
                     }
                     Divider()
+                    if let detail = model.snapshot?.jobs.first(where: { $0.status == "running" })?.detail {
+                        HStack { ProgressView().controlSize(.small); Text(detail).font(.caption).foregroundStyle(.secondary) }.padding(.horizontal,12)
+                    }
                     HStack {
                         Button { modelPickerShown.toggle() } label: { Image(systemName: "cpu").foregroundStyle(.secondary) }
                             .buttonStyle(.plain).help("Выбрать модель").disabled(model.running)
                             .popover(isPresented:$modelPickerShown) { ModelPickerPopup(model:model, isPresented:$modelPickerShown) }
                         Spacer()
+                        Button("Нарисовать", action: model.drawImage)
+                            .help("Создать картинку по тексту в поле ввода локально, без текстовой модели. Настройки → Модель → Генерация изображений.")
+                            .accessibilityIdentifier("image.generate").smokeControl("image.generate")
+                            .disabled(model.running || model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.snapshot == nil)
                         Button(action: { model.attach() }) { Image(systemName: "paperclip") }.disabled(model.running)
                     }.padding(.horizontal,12).padding(.top,8)
                     Composer(text: $model.draft, enterSends: enterSends, send: { if !model.running { model.send() } }, files: model.running ? nil : { urls in urls.forEach { model.attach($0) } }).frame(height:90).padding(8)
@@ -923,6 +937,13 @@ struct SettingsView: View {
     @State var imageBase = ""
     @State var imageModel = ""
     @State var imageKey = ""
+    @State var imageProvider = "local"
+    @State var imageLocalModel = ""
+    @State var imageCompute = "auto"
+    @State var imageWidth = 512
+    @State var imageHeight = 512
+    @State var imageSteps = 20
+    @State var imageCFG = 7.0
     @State var modelKey = ""
     @State var braveKey = ""
     @State var tavilyKey = ""
@@ -984,13 +1005,31 @@ struct SettingsView: View {
                     SecureField("Ключ модели",text: $modelKey)
                     Section("Генерация изображений · отдельная модель") {
                         Toggle("Включить генератор изображений",isOn:$imageEnabled)
-                        if imageEnabled && (imageBase.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty || imageModel.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty) {
-                            Text("Переключатель можно сохранить сейчас. Для генерации заполни адрес API и ID модели; при необходимости — ключ.").font(.caption).foregroundStyle(.secondary)
+                        Picker("Где создавать",selection:$imageProvider) {
+                            Text("На этом Mac · без интернета").tag("local")
+                            Text("Облачный Images API").tag("cloud")
                         }
-                        TextField("Адрес OpenAI-совместимого Images API, с /v1",text:$imageBase)
-                        TextField("ID модели изображений",text:$imageModel)
-                        SecureField("Ключ генератора изображений",text:$imageKey)
-                        Text("Основная модель вызывает генератор как инструмент. Нужен интернет. Поддерживается /images/generations с ответом b64_json; картинка сохраняется в проекте.").font(.caption)
+                        if imageProvider == "local" {
+                            Text(imageLocalModel.isEmpty ? "Checkpoint изображений не выбран" : URL(fileURLWithPath:imageLocalModel).lastPathComponent).lineLimit(2).help(imageLocalModel)
+                            Button("Выбрать модель изображений…") {
+                                let panel=NSOpenPanel(); panel.allowedFileTypes=["gguf","safetensors"]; panel.allowsMultipleSelection=false
+                                if panel.runModal() == .OK, let url=panel.url { imageLocalModel=url.path }
+                            }
+                            Text("Полный checkpoint Stable Diffusion 1.x / 2.x / SDXL (.safetensors или GGUF для stable-diffusion.cpp). Не текстовый GGUF и не LoRA. FLUX / SD3 с отдельными компонентами пока не подключены. Веса выбираются с диска, в установщик не входят.").font(.caption).foregroundStyle(.secondary)
+                            HStack {
+                                Picker("Ширина",selection:$imageWidth) { ForEach([256,512,768,1024],id: \.self) { Text(String($0)).tag($0) } }
+                                Picker("Высота",selection:$imageHeight) { ForEach([256,512,768,1024],id: \.self) { Text(String($0)).tag($0) } }
+                            }
+                            Stepper("Шаги: \(imageSteps)",value:$imageSteps,in:1...50)
+                            Slider(value:$imageCFG,in:1...15,step:0.5) { Text("CFG: \(imageCFG,specifier:"%.1f")") }
+                            Picker("Вычисления",selection:$imageCompute) { Text("Авто · Metal при наличии").tag("auto"); Text("CPU · медленнее").tag("cpu") }
+                            Text("Нужна macOS 26+. Напиши запрос и нажми «Нарисовать» в чате — текстовая модель не нужна. Английские запросы лучше подходят большинству SD checkpoint. Для снижения расхода памяти текстовая модель выгружается и загрузится при следующем ответе. «Стоп» отменяет создание.").font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            TextField("Адрес OpenAI-совместимого Images API, с /v1",text:$imageBase)
+                            TextField("ID модели изображений",text:$imageModel)
+                            SecureField("Ключ генератора изображений",text:$imageKey)
+                            Text("Основная модель вызывает облачный генератор как инструмент. Нужен интернет. /images/generations с b64_json. Автоматического перехода в облако нет.").font(.caption)
+                        }
                     }
                     Picker("Поиск",selection:$searchProvider) { Text("Brave").tag("brave");Text("Tavily").tag("tavily");Text("Serper").tag("serper") }
                     SecureField("Ключ Brave Search",text: $braveKey)
@@ -1083,7 +1122,7 @@ struct SettingsView: View {
             }
         }.padding(24).frame(width: 1000,height: 720).modifier(AppTheme()).tint(.gray).accentColor(.gray).buttonStyle(MonochromeButton()).interactiveDismissDisabled()
         .onAppear {
-            if let s = model.snapshot?.settings { imageEnabled=s.imageEnabled ?? false; imageBase=s.imageBaseURL ?? ""; imageModel=s.imageModel ?? ""; thermalEnabled=s.thermalEnabled ?? false; thermalLimit=s.thermalLimit ?? 80; mode=s.mode; provider=s.provider; base=s.baseURL; selectedModel=s.model; limit=s.contextLimit; temperature=s.temperature; toolsEnabled=s.toolsEnabled;searchProvider=s.searchProvider ?? "brave" }
+            if let s = model.snapshot?.settings { imageProvider=s.imageProvider ?? "cloud"; imageLocalModel=s.imageLocalModel ?? ""; imageCompute=s.imageCompute ?? "auto"; imageWidth=s.imageWidth ?? 512; imageHeight=s.imageHeight ?? 512; imageSteps=s.imageSteps ?? 20; imageCFG=s.imageCFG ?? 7; imageEnabled=s.imageEnabled ?? false; imageBase=s.imageBaseURL ?? ""; imageModel=s.imageModel ?? ""; thermalEnabled=s.thermalEnabled ?? false; thermalLimit=s.thermalLimit ?? 80; mode=s.mode; provider=s.provider; base=s.baseURL; selectedModel=s.model; limit=s.contextLimit; temperature=s.temperature; toolsEnabled=s.toolsEnabled;searchProvider=s.searchProvider ?? "brave" }
             imageKey=Keys.get("image"); modelKey=Keys.get("model"); braveKey=Keys.get("brave");tavilyKey=Keys.get("tavily");serperKey=Keys.get("serper")
             profileID=model.chat?.profileID ?? model.snapshot?.profiles.first?.id ?? ""; loadProfile(profileID)
         }
@@ -1100,7 +1139,7 @@ struct SettingsView: View {
         guard !model.running else { return }
         model.error = ""
         model.perform {
-            _ = try await model.api("/settings", ["imageEnabled":imageEnabled,"imageBaseURL":imageBase,"imageModel":imageModel,"thermalEnabled":thermalEnabled,"thermalLimit":thermalLimit,"mode":mode,"provider":provider,"baseURL":base,"model":selectedModel,"contextLimit":limit,"temperature":temperature,"toolsEnabled":toolsEnabled,"searchProvider":searchProvider])
+            _ = try await model.api("/settings", ["imageProvider":imageProvider,"imageLocalModel":imageLocalModel,"imageCompute":imageCompute,"imageWidth":imageWidth,"imageHeight":imageHeight,"imageSteps":imageSteps,"imageCFG":imageCFG,"imageEnabled":imageEnabled,"imageBaseURL":imageBase,"imageModel":imageModel,"thermalEnabled":thermalEnabled,"thermalLimit":thermalLimit,"mode":mode,"provider":provider,"baseURL":base,"model":selectedModel,"contextLimit":limit,"temperature":temperature,"toolsEnabled":toolsEnabled,"searchProvider":searchProvider])
             try Keys.set("image",imageKey); try Keys.set("model",modelKey); try Keys.set("brave",braveKey);try Keys.set("tavily",tavilyKey);try Keys.set("serper",serperKey)
             _ = try await model.api("/keys", ["image":imageKey,"model":modelKey,"brave":braveKey,"tavily":tavilyKey,"serper":serperKey])
             if !profileName.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty {

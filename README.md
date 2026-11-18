@@ -105,3 +105,35 @@ Automated provider tests use a mock; live paid generation is not yet verified. N
 - Drag local files from Finder into the composer to use the same extraction/import path as the paperclip (12 MB limit). This imports text/OCR, not general multimodal image understanding.
 - «Аа» persists the text size for messages and the composer. The printer button opens the native print dialog for the full chat; choose PDF → Save as PDF to export. Printing includes text, headings, code and textual table rows, not image attachments.
 - The 0.3.5 fix allowing incomplete image-generator settings to be saved is preserved.
+
+
+## Выпуск 0.3.8 — локальные изображения
+
+«Настройки → Модель → Генерация изображений»: включить, выбрать «На этом Mac»,
+указать полный checkpoint SD 1.x / SD 2.x / SDXL (.safetensors или GGUF для
+stable-diffusion.cpp), сохранить. Это отдельная модель, не файл текстовой LLM.
+Веса в DMG не входят. Отдельные UNet/LoRA и FLUX/SD3 с отдельными компонентами
+этим интерфейсом не поддержаны; поддержка архитектуры не определяется расширением.
+
+Встроенный CPU/Metal runtime этой сборки требует **macOS 26+**. Остальные функции
+приложения сохраняют прежние требования. На виртуальной macOS VirtualMac авто-режим
+использует CPU: paravirtual Metal не выполнил проверочный SD-граф. На физическом Mac
+авто-режим предоставляет выбор устройства движку; физический Metal ещё не проверен.
+
+Напиши запрос в чате и нажми **«Нарисовать»**. Текстовая модель и API не нужны.
+Картинка появится вложением с предпросмотром, открытием и сохранением. Можно также
+поручить generate_image текстовой модели, поддерживающей инструменты. В офлайн-режиме
+локальный генератор доступен; сеть его процессу и потомкам запрещена sandbox-exec.
+Облачный Images API — отдельный явный выбор, никогда не fallback.
+
+«Стоп» завершает процесс; частичные файлы не прикрепляются. Ограничение одного
+запуска — 30 минут. Поддерживаются размеры 256/512/768/1024, 1–50 шагов, CFG 1–15.
+Обычным checkpoint нужны обычные параметры; однокроковые/distilled модели требуют
+параметров своего автора. Для тестового Hyper-SD 1-step использованы 1 шаг и CFG 1.
+Перед изображением выгружается только текстовый движок текущего Inij, чтобы не держать
+обе модели в памяти; следующий текстовый запрос загрузит его вновь. Веса лежат снаружи
+приложения и не добавляются в архив чатов.
+
+Runtime: leejet/stable-diffusion.cpp master-1106-532d2c1; скачивание, SHA256 и извлечение
+arm64 воспроизводятся scripts/install-image-runtime.sh. Лицензии вложены в app.
+Отчёт выпуска и точные проверки: ../COMPLETION.md.

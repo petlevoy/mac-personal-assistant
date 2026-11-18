@@ -6,6 +6,11 @@ from core import MAX_FILE, request_json, safe_path, uid, validate_endpoint
 
 
 def generate(store, job, args, settings):
+    if not settings.get('imageEnabled'):
+        raise ValueError('Включи генератор изображений в настройках')
+    if settings.get('imageProvider','cloud') == 'local':
+        from local_images import generate as local_generate
+        return local_generate(store, job, args, settings)
     if settings['mode'] == 'offline':
         raise ValueError('Для генерации изображений включи интернет')
     if not settings.get('imageEnabled'):

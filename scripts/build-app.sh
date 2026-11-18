@@ -42,6 +42,7 @@ for f in (res/'llama').iterdir():
     if f.is_file() and not f.is_symlink() and f.name not in ('llama-server','LICENSE') and not f.name.endswith('.dylib'):
         f.unlink()
 PYSLIM
+bash scripts/install-image-runtime.sh "$app" "$PWD/build/cache"
 cp backend/*.py "$app/Contents/Resources/backend/"
 cp macos/Info.plist "$app/Contents/Info.plist"
 xcrun swift macos/MakeIcon.swift "$PWD/build/AppIcon.iconset"
@@ -53,7 +54,7 @@ xcrun --sdk macosx swiftc -swift-version 5 -parse-as-library -O \
 # Runtime dylibs/extensions must be signed before their containing app.
 while IFS= read -r -d '' item; do
   if file -b "$item" | grep -q 'Mach-O'; then codesign --force --sign "${SIGNING_IDENTITY:--}" "$item"; fi
-done < <(find "$app/Contents/Resources/python" "$app/Contents/Resources/llama" -type f -print0)
+done < <(find "$app/Contents/Resources/python" "$app/Contents/Resources/llama" "$app/Contents/Resources/stable-diffusion" -type f -print0)
 if [[ -n "${SIGNING_IDENTITY:-}" ]]; then
   codesign --force --options runtime --timestamp --entitlements macos/Entitlements.plist --sign "$SIGNING_IDENTITY" "$app"
 else
@@ -70,11 +71,11 @@ stage="$PWD/build/dmg-stage"
 mkdir -p "$stage"
 ditto "$app" "$stage/Inij.app"
 [[ -L "$stage/Applications" ]] || ln -s /Applications "$stage/Applications"
-hdiutil create -volname 'Inij' -srcfolder "$stage" -ov -format UDZO "$PWD/dist/Inij-0.3.7-arm64.dmg"
+hdiutil create -volname 'Inij' -srcfolder "$stage" -ov -format UDZO "$PWD/dist/Inij-0.3.8-arm64.dmg"
 if [[ -n "${NOTARY_PROFILE:-}" ]]; then
-  xcrun notarytool submit "$PWD/dist/Inij-0.3.7-arm64.dmg" --keychain-profile "$NOTARY_PROFILE" --wait
-  xcrun stapler staple "$PWD/dist/Inij-0.3.7-arm64.dmg"
+  xcrun notarytool submit "$PWD/dist/Inij-0.3.8-arm64.dmg" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple "$PWD/dist/Inij-0.3.8-arm64.dmg"
 fi
-"$python_bin" -I -B scripts/verify_installer.py "$PWD/dist/Inij-0.3.7-arm64.dmg" "$PWD/build/installed-smoke.json"
-shasum -a 256 "$PWD/dist/Inij-0.3.7-arm64.dmg"
+"$python_bin" -I -B scripts/verify_installer.py "$PWD/dist/Inij-0.3.8-arm64.dmg" "$PWD/build/installed-smoke.json"
+shasum -a 256 "$PWD/dist/Inij-0.3.8-arm64.dmg"
 echo 'Release built; packaged/installed LaunchServices smoke and post-launch signatures passed. Ad-hoc build is not notarized.'
