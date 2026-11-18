@@ -18,7 +18,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized(): return self.send_json({'error':'Unauthorized'},401)
         try:
             if self.path=='/state': return self.send_json(self.server.store.snapshot())
-            if self.path=='/local/library': return self.send_json({'models':self.server.store.local.library()})
+            if self.path=='/local/library': return self.send_json({'models':self.server.store.model_library()})
             if self.path=='/models': return self.send_json({'models':self.server.store.models()})
             self.send_json({'error':'Not found'},404)
         except Exception as e: self.send_json({'error':str(e)[:600]},400)
@@ -31,6 +31,12 @@ class Handler(BaseHTTPRequestHandler):
             if self.path=='/local/load':
                 s.idle(); s.local.load(data['path'],s.data['settings']['contextLimit'])
                 s.update_settings({'provider':'local','model':str(pathlib.Path(data['path']).expanduser().resolve()),'mode':'internet' if s.data['settings']['mode']=='cloud' else s.data['settings']['mode']})
+            elif self.path=='/models/delete-preview':
+                from model_deletion import preview
+                return self.send_json(preview(s,data['path']))
+            elif self.path=='/models/delete':
+                from model_deletion import delete
+                return self.send_json(delete(s,data['token']))
             elif self.path=='/local/unload': s.idle(); s.local.close()
             elif self.path=='/explore/search': return self.send_json({'models':s.local.search(str(data.get('query','')))})
             elif self.path=='/explore/files': return self.send_json({'files':s.local.files(data['repo']),'repo':data['repo']})
@@ -86,9 +92,12 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path=='/attachment':
                 source=pathlib.Path(data['path']).resolve()
                 if not source.is_file() or source.stat().st_size>MAX_FILE: raise ValueError('Выбери файл до 12 МБ')
+                s.project(data['projectID']) # validate project before any write
                 folder=s.root/'projects'/data['projectID']/'files'; folder.mkdir(parents=True,exist_ok=True)
                 target=folder/(uid()[:8]+'-'+source.name); shutil.copy2(source,target)
-                if 'extractedText' in data: text=str(data['extractedText'])[:60000]; truncated=len(data['extractedText'])>60000
+                if 'extractedText' in data:
+                    text=str(data['extractedText']); truncated=False
+                    if len(text)>2_000_000: raise ValueError('Документ больше 2 000 000 символов. Текст не был обрезан.')
                 else: text,truncated=extract_text(target)
                 return self.send_json({'text':text,'truncated':truncated,'name':source.name,'storedPath':str(target)})
             elif self.path=='/chat/export':

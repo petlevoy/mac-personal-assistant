@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import Foundation
+import PDFKit
 
 // Geometry anchors exist only in the isolated smoke launch. Events still pass through
 // the real NSWindow hit-testing and SwiftUI button/checkbox dispatch, never actions directly.
@@ -385,6 +386,82 @@ extension View {
             }
             try require(model.snapshot?.jobs.first(where: { $0.id == active.id })?.status == "done", "same generation completes after settings dismissal")
             try require(model.chat?.messages.last?.content.contains("STREAM_COMPLETED") == true, "remaining streaming response reaches chat after closing settings")
+        }
+        if let flag=CommandLine.arguments.firstIndex(of:"--documents-smoke-base"),CommandLine.arguments.count>flag+1 {
+            let base=CommandLine.arguments[flag+1]
+            let fixture=FileManager.default.temporaryDirectory.appendingPathComponent("Inij-039-"+UUID().uuidString).resolvingSymlinksInPath()
+            try FileManager.default.createDirectory(at:fixture,withIntermediateDirectories:true)
+            defer { try? FileManager.default.removeItem(at:fixture) }
+            let image=NSImage(size:NSSize(width:1200,height:400));image.lockFocus()
+            NSColor.white.setFill();NSRect(x:0,y:0,width:1200,height:400).fill()
+            ("OCR SCAN MIDDLE 456" as NSString).draw(at:NSPoint(x:50,y:200),withAttributes:[.font:NSFont.systemFont(ofSize:48),.foregroundColor:NSColor.black]);image.unlockFocus()
+            let bitmap=NSBitmapImageRep(data:image.tiffRepresentation!)!
+            let png=fixture.appendingPathComponent("scan.png");try bitmap.representation(using:.png,properties:[:])!.write(to:png)
+            let imageText=try await Task.detached { try DocumentReader.extract(png) }.value
+            try require(imageText.contains("MIDDLE") && imageText.contains("456"),"offline Vision image OCR reads fixture")
+            let textView=ChatTranscript.textView(title:"PDF",messages:[ChatMessage(role:"assistant",content:"PDF TEXT START 123")],size:24)
+            let mixed=PDFDocument(data:textView.dataWithPDF(inside:textView.bounds))!
+            mixed.insert(PDFPage(image:image)!,at:mixed.pageCount)
+            let pdf=fixture.appendingPathComponent("mixed.pdf");try require(mixed.write(to:pdf),"mixed text/scanned PDF fixture saved")
+            let recognized=try await Task.detached { try DocumentReader.extract(pdf) }.value
+            try require(recognized.contains("START 123") && recognized.contains("MIDDLE") && recognized.contains("456"),"per-page extraction preserves text AND scanned pages in mixed PDF")
+            model.draft=""
+            model.attach(pdf)
+            for _ in 0..<100 { if model.draft.contains("MIDDLE") { break };try await Task.sleep(nanoseconds:100_000_000) }
+            try require(model.draft.contains("START 123") && model.draft.contains("MIDDLE"),"native PDF attachment uses offline mixed-page recognition")
+            let large="START-123\n"+String(repeating:"Текст большого документа.\n",count:1600)+"MIDDLE-456\n"+String(repeating:"Текст большого документа.\n",count:1600)+"END-987"
+            let file=fixture.appendingPathComponent("large.txt");try large.write(to:file,atomically:true,encoding:.utf8)
+            model.draft="Найди маркеры."
+            model.attach(file)
+            for _ in 0..<100 { if model.draft.contains("END-987") { break };try await Task.sleep(nanoseconds:100_000_000) }
+            try require(large.count>60000 && model.draft.contains(large),"native attachment imports over 60000 characters with beginning/middle/end intact")
+            _ = try await model.api("/settings",["provider":"openai","mode":"offline","baseURL":base,"model":"fixture","toolsEnabled":false,"contextLimit":4096])
+            model.send()
+            for _ in 0..<500 { try await Task.sleep(nanoseconds:100_000_000);try await model.refresh();if let job=model.snapshot?.jobs.last,job.status != "running" { break } }
+            try require(model.snapshot?.jobs.last?.status == "done","large document sent through native composer and fully processed: "+(model.snapshot?.jobs.last?.error ?? ""))
+            let answer=model.chat?.messages.last?.content ?? ""
+            try require(answer.contains("START-123") && answer.contains("MIDDLE-456") && answer.contains("END-987"),"all three distant markers reach native final answer")
+            try require((model.chat?.messages.last?.artifacts ?? []).count == 3,"original, per-part results and coverage manifest exposed as chat files")
+            try await Task.sleep(nanoseconds:1000_000_000)
+            try require(SmokeControlView.controls.object(forKey:"document.artifact.original.txt")?.window === window,"document file card mounted visibly in native chat")
+            if !CommandLine.arguments.contains("--skip-capture") { try capture("large-document",window) }
+            // Test UI deletion using only tiny fixtures, never a user's weights.
+            for kind in ["text","image"] {
+                let path=fixture.appendingPathComponent(kind == "text" ? "fixture.gguf" : "fixture.safetensors")
+                try Data([71,71,85,70,3,0,0,0,0,0,0,0]).write(to:path)
+                if kind == "text" { _ = try await model.api("/settings",["provider":"local","model":path.path]) }
+                else { _ = try await model.api("/settings",["imageLocalModel":path.path]) }
+                try await model.refresh()
+                let testWindow=NSWindow(contentRect:NSRect(x:120,y:100,width:850,height:650),styleMask:[.titled,.closable],backing:.buffered,defer:false)
+                testWindow.isReleasedWhenClosed=false
+                testWindow.contentView=NSHostingView(rootView:ExploreView(model:model,embedded:true,tab:1).frame(width:850,height:650))
+                testWindow.makeKeyAndOrderFront(nil)
+                for _ in 0..<40 { if SmokeControlView.controls.object(forKey:"model.delete")?.window === testWindow { break };try await Task.sleep(nanoseconds:100_000_000) }
+                report["deletion_library_"+kind]=try await model.api("/local/library")
+                if !CommandLine.arguments.contains("--skip-capture") { try capture("model-before-"+kind,testWindow) }
+                func chooseAlert(_ title:String) {
+                    let timer=Timer(timeInterval:0.8,repeats:false) { _ in
+                        MainActor.assumeIsolated {
+                            func buttons(_ view:NSView)->[NSButton] { (view as? NSButton).map { [$0] } ?? view.subviews.flatMap { buttons($0) } }
+                            if let modal=NSApp.modalWindow, let root=modal.contentView, let button=buttons(root).first(where:{$0.title == title}) { button.performClick(nil) }
+                            else { NSApp.abortModal() }
+                        }
+                    }
+                    RunLoop.main.add(timer,forMode:.modalPanel)
+                }
+                chooseAlert("Отмена");try await clickControl("model.delete",in:testWindow)
+                try await Task.sleep(nanoseconds:1200_000_000)
+                try require(FileManager.default.fileExists(atPath:path.path),kind+" deletion cancelled through confirmation dialog")
+                if !CommandLine.arguments.contains("--skip-capture") { try capture("model-library-"+kind,testWindow) }
+                chooseAlert("В Корзину");try await clickControl("model.delete",in:testWindow)
+                for _ in 0..<60 { if !FileManager.default.fileExists(atPath:path.path) { break };try await Task.sleep(nanoseconds:100_000_000) }
+                try require(!FileManager.default.fileExists(atPath:path.path),kind+" fixture deleted using library mouse click and confirmed dialog")
+                try await model.refresh();try require((kind == "text" ? model.snapshot?.settings.model : model.snapshot?.settings.imageLocalModel) == "",kind+" deleted selection cleared")
+                testWindow.close()
+            }
+            // Restore baseline settings for remaining smoke checks.
+            _ = try await model.api("/settings",["provider":"local","mode":"offline","model":"","imageLocalModel":""])
+            try await model.refresh()
         }
         if let flag = CommandLine.arguments.firstIndex(of: "--local-image-smoke-model"), CommandLine.arguments.count > flag + 1 {
             let modelPath=CommandLine.arguments[flag + 1]

@@ -197,6 +197,7 @@ struct Project: Codable, Identifiable {
 }
 struct Job: Codable, Identifiable {
     var detail: String?
+    var progress: String?
     var id: String; var projectID: String; var chatID: String; var status: String; var error: String; var newChatID: String?
 }
 struct Pending: Codable, Identifiable {
@@ -548,9 +549,32 @@ struct BrowserView: NSViewRepresentable {
         let field = NSTextField(frame:NSRect(x:0,y:0,width:450,height:100));field.stringValue=content;alert.accessoryView=field
         if alert.runModal() == .alertFirstButtonReturn { changeChat("edit",index:index,text:field.stringValue) }
     }
+    var documentWindows: [NSWindow] = []
+    func showFullText(_ text: String) {
+        let window=NSWindow(contentRect:NSRect(x:150,y:150,width:800,height:600),styleMask:[.titled,.closable,.resizable],backing:.buffered,defer:false)
+        window.title="Полный текст";window.isReleasedWhenClosed=false
+        let scroll=NSScrollView(frame:window.contentView!.bounds);scroll.hasVerticalScroller=true;scroll.autoresizingMask=[.width,.height]
+        let view=NSTextView(frame:scroll.bounds);view.string=text;view.isEditable=false;view.isSelectable=true;view.isVerticallyResizable=true;view.autoresizingMask=[.width];view.textContainer?.widthTracksTextView=true
+        scroll.documentView=view;window.contentView=scroll
+        documentWindows.removeAll { !$0.isVisible };documentWindows.append(window);window.makeKeyAndOrderFront(nil)
+    }
+    func deleteModel(_ path: String, completion: @escaping () -> Void = {}) {
+        perform {
+            let info = try await self.api("/models/delete-preview", ["path":path])
+            guard let token=info["token"] as? String else { throw AppError(message:"Не удалось подготовить удаление") }
+            let alert=NSAlert(); alert.alertStyle = .warning
+            alert.messageText="Переместить модель в Корзину?"
+            let bytes=(info["size"] as? NSNumber)?.int64Value ?? 0
+            alert.informativeText="\(info["name"] as? String ?? path)\n\(ByteCountFormatter.string(fromByteCount:bytes,countStyle:.file))\n\(path)\n" + ((info["external"] as? Bool == true) ? "Это выбранный файл вне папки приложения. Он будет перемещён с указанного места. " : "") + "Загруженная модель будет выгружена. Восстановить файл можно из Корзины. Место освободится после её очистки."
+            alert.addButton(withTitle:"В Корзину"); alert.addButton(withTitle:"Отмена")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            _ = try await self.api("/models/delete", ["token":token])
+            try await self.refresh();completion()
+        }
+    }
     func attach() {
         let panel = NSOpenPanel(); panel.canChooseFiles = true; panel.canChooseDirectories = false
-        panel.message = "Текст будет вставлен в сообщение; в облачном режиме он уйдет выбранному провайдеру. До 12 МБ."
+        panel.message = "До 12 МБ / 2 млн символов. Большие документы читаются по частям. PDF и изображения: локальное распознавание. В облачном режиме текст отправляется выбранному провайдеру."
         guard panel.runModal() == .OK, let url = panel.url else { return }
         attach(url)
     }
@@ -562,36 +586,11 @@ struct BrowserView: NSViewRepresentable {
             guard size <= 12 * 1024 * 1024 else { throw AppError(message: "Файл больше 12 МБ") }
             var payload: [String: Any] = ["projectID": pid, "path": url.path]
             let ext = url.pathExtension.lowercased()
-            if ext == "pdf" {
-                guard let doc = PDFDocument(url: url) else { throw AppError(message: "PDF не открылся") }
-                let text = doc.string ?? ""
-                if text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty {
-                    guard doc.pageCount <= 80 else { throw AppError(message:"Для OCR раздели PDF на части до 80 страниц") }
-                    var pages: [String] = []
-                    for i in 0..<doc.pageCount {
-                        guard let page = doc.page(at:i) else { continue }
-                        let image = page.thumbnail(of:NSSize(width:1600,height:2200),for:.mediaBox)
-                        guard let data = image.tiffRepresentation else { continue }
-                        let recognized = try await Task.detached {
-                            let request = VNRecognizeTextRequest();request.recognitionLevel = .accurate;request.recognitionLanguages=["ru-RU","en-US"]
-                            try VNImageRequestHandler(data:data).perform([request])
-                            return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator:"\n")
-                        }.value
-                        pages.append("[Страница \(i+1)]\n"+recognized)
-                    }
-                    payload["extractedText"] = pages.joined(separator:"\n")
-                } else { payload["extractedText"] = text }
-            } else if ["png", "jpg", "jpeg", "tiff", "heic", "webp"].contains(ext) {
-                let text = try await Task.detached {
-                    let request = VNRecognizeTextRequest(); request.recognitionLevel = .accurate; request.recognitionLanguages = ["ru-RU", "en-US"]
-                    try VNImageRequestHandler(url: url).perform([request])
-                    return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
-                }.value
-                guard !text.isEmpty else { throw AppError(message: "Текст на картинке не распознан. Визуальное описание моделью пока не подключено.") }
-                payload["extractedText"] = text
+            if ["pdf", "png", "jpg", "jpeg", "tiff", "heic", "webp"].contains(ext) {
+                payload["extractedText"] = try await Task.detached { try DocumentReader.extract(url) }.value
             }
             let r = try await self.api("/attachment", payload)
-            let note = (r["truncated"] as? Bool == true) ? " [ОБРЕЗАНО до 60000 символов]" : ""
+            let note = ""
             let addition = "\n\n[Файл: \(url.lastPathComponent)\(note)]\n\(r["text"] as? String ?? "")\n[Конец файла]\n"
             if self.projectID == pid && self.chatID == cid { self.draft += addition }
             else { self.draftStore.write(self.draftStore.read(pid,cid) + addition, pid,cid) }
@@ -752,9 +751,16 @@ struct MainView: View {
                                         VStack(alignment: .leading, spacing: 6) {
                                             Text(message.role == "user" ? "Ты" : "Помощник").font(.caption.bold()).foregroundStyle(.secondary)
                                             if message.role == "user" { Button("Изменить") { model.editMessage(index,message.content) }.font(.caption).disabled(model.running) }
+                                            if message.content.count > 12000 { Button("Открыть полный текст…") { model.showFullText(message.content) } }
                                             Button("Цитировать") { model.draft += (model.draft.isEmpty ? "" : "\n\n") + message.content.components(separatedBy: "\n").map { "> " + $0 }.joined(separator: "\n") + "\n\n" }.font(.caption)
-                                            ChatMessageText(content: message.content.isEmpty && message.streaming == true ? "…" : message.content)
+                                            ChatMessageText(content: message.content.count > 12000 ? String(message.content.prefix(1200))+"\n\n[Большое сообщение: показано начало. Полный текст сохранён и обрабатывается целиком.]" : (message.content.isEmpty && message.streaming == true ? "…" : message.content))
                                                 .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                                            ForEach(message.artifacts ?? [],id: \.path) { artifact in
+                                                VStack(alignment:.leading,spacing:4) {
+                                                    Label(artifact.name,systemImage:"doc.fill")
+                                                    HStack { Button("Открыть") { fileAction(artifact,action:"open") }; Button("Показать в Finder") { fileAction(artifact,action:"reveal") }; Button("Сохранить как…") { fileAction(artifact,action:"save") } }
+                                                }.padding(8).background(Color.primary.opacity(0.06)).smokeControl("document.artifact."+artifact.name)
+                                            }
                                         }.padding(14).background(message.role == "user" ? Color.primary.opacity(0.08) : Color.secondary.opacity(0.06))
                                             .clipShape(RoundedRectangle(cornerRadius: 10)).id(index)
                                     } else {
@@ -780,6 +786,9 @@ struct MainView: View {
                                 Color.clear.frame(height: 1).id("bottom")
                             }.padding()
                         }.onChange(of: model.chat?.messages.count) { _ in proxy.scrollTo("bottom", anchor: .bottom) }
+                        .onChange(of: model.running) { running in
+                            if !running { DispatchQueue.main.asyncAfter(deadline:.now()+0.15) { proxy.scrollTo("bottom",anchor:.bottom) } }
+                        }
                     }
                     if let pending = model.approval {
                         VStack(alignment: .leading, spacing: 8) {
@@ -813,6 +822,7 @@ struct MainView: View {
                             .disabled(model.running || model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.snapshot == nil)
                         Button(action: { model.attach() }) { Image(systemName: "paperclip") }.disabled(model.running)
                     }.padding(.horizontal,12).padding(.top,8)
+                    if let progress=model.snapshot?.jobs.last?.progress, model.running { Text(progress).font(.caption).padding(.horizontal,12) }
                     Composer(text: $model.draft, enterSends: enterSends, send: { if !model.running { model.send() } }, files: model.running ? nil : { urls in urls.forEach { model.attach($0) } }).frame(height:90).padding(8)
                     HStack {
                         Button("Повторить ответ") { model.changeChat("retry") }.disabled(model.running || (model.chat?.messages.isEmpty ?? true))
@@ -987,6 +997,7 @@ struct SettingsView: View {
                                 Button("Обзор…", action: browseModel)
                                 Button("Загрузить модель") { save(fetch:false, load:true) }.disabled(selectedModel.isEmpty)
                                 Button("Выгрузить") { model.perform { _ = try await model.api("/local/unload",[:]) } }
+                                Button("Удалить…") { model.deleteModel(selectedModel) { selectedModel="" } }.disabled(selectedModel.isEmpty || model.running)
                             }
                             Text("GGUF запускается встроенным движком на этом Mac. Другие приложения не нужны. Поддержка зависит от архитектуры модели.").font(.caption).foregroundStyle(.secondary)
                             if let local = model.snapshot?.localModel { Text(local.status == "loading" ? "Загружаю…" : local.status == "ready" ? "Модель готова" : local.error).font(.caption) }
@@ -1015,6 +1026,7 @@ struct SettingsView: View {
                                 let panel=NSOpenPanel(); panel.allowedFileTypes=["gguf","safetensors"]; panel.allowsMultipleSelection=false
                                 if panel.runModal() == .OK, let url=panel.url { imageLocalModel=url.path }
                             }
+                            Button("Удалить модель изображений…") { model.deleteModel(imageLocalModel) { imageLocalModel="" } }.disabled(imageLocalModel.isEmpty || model.running)
                             Text("Полный checkpoint Stable Diffusion 1.x / 2.x / SDXL (.safetensors или GGUF для stable-diffusion.cpp). Не текстовый GGUF и не LoRA. FLUX / SD3 с отдельными компонентами пока не подключены. Веса выбираются с диска, в установщик не входят.").font(.caption).foregroundStyle(.secondary)
                             HStack {
                                 Picker("Ширина",selection:$imageWidth) { ForEach([256,512,768,1024],id: \.self) { Text(String($0)).tag($0) } }
@@ -1252,7 +1264,7 @@ struct InspectorView: View {
 
 struct CatalogModel: Identifiable { let id: String; let downloads: Int }
 struct CatalogFile: Identifiable { let name: String; let size: Int64; var id: String { name } }
-struct LocalLibraryModel: Identifiable { let path: String; let name: String; let size: Int64; var id: String { path } }
+struct LocalLibraryModel: Identifiable { let path: String; let name: String; let size: Int64; var kind: String = "text"; var id: String { path } }
 struct ExploreView: View {
     @ObservedObject var model: AppModel
     var embedded = false
@@ -1263,7 +1275,7 @@ struct ExploreView: View {
     @State private var repo = ""
     @State private var busy = false
     @State private var notice = ""
-    @State private var tab = 0
+    @State var tab = 0
     var body: some View {
         VStack(alignment:.leading,spacing:16) {
             HStack { Text("Explore · модели").font(.title2); Spacer(); if !embedded { Button("Закрыть") { model.exploreShown=false } } }
@@ -1302,7 +1314,11 @@ struct ExploreView: View {
                     List(library) { item in
                         VStack(alignment:.leading,spacing:6) {
                             Text(item.name).lineLimit(2).truncationMode(.middle)
-                            HStack { Text(size(item.size)).font(.caption); Spacer(); Button("Выбрать и загрузить") { load(item.path) }.disabled(model.running) }
+                            HStack {
+                                Text(size(item.size) + (item.kind == "image" ? " · изображение" : " · GGUF")).font(.caption); Spacer()
+                                if item.kind != "image" { Button("Выбрать и загрузить") { load(item.path) }.disabled(model.running) }
+                                Button("Удалить…") { model.deleteModel(item.path) { loadLibrary() } }.disabled(model.running || busy).accessibilityIdentifier("model.delete").smokeControl("model.delete")
+                            }
                         }.padding(.vertical,4)
                     }
                 }.padding(12) } else {
@@ -1315,7 +1331,7 @@ struct ExploreView: View {
                         HStack {
                             if d.status == "downloading" { Button("Пауза") { control(d.id,"pause") } }
                             if ["paused","error","cancelled"].contains(d.status) { Button("Продолжить") { control(d.id,"resume") } }
-                            if d.status == "complete" { Button("Загрузить модель") { load(d.path) }.disabled(model.running) }
+                            if d.status == "complete" { Button("Загрузить модель") { load(d.path) }.disabled(model.running); Button("Удалить…") { model.deleteModel(d.path) { loadLibrary() } }.disabled(model.running) }
                             else if d.status != "verifying" { Button("Отменить") { control(d.id,"cancel") } }
                         }
                     }.padding(.vertical,6)
@@ -1352,7 +1368,7 @@ struct ExploreView: View {
     }
     func control(_ id:String,_ action:String) { model.perform { _ = try await model.api("/downloads/control",["id":id,"action":action]) } }
     func loadLibrary() { Task { do {
-        let r=try await model.api("/local/library");library=(r["models"] as? [[String:Any]] ?? []).compactMap { v in guard let path=v["path"] as? String else{return nil};return LocalLibraryModel(path:path,name:v["name"] as? String ?? path,size:(v["size"] as? NSNumber)?.int64Value ?? 0) }
+        let r=try await model.api("/local/library");library=(r["models"] as? [[String:Any]] ?? []).compactMap { v in guard let path=v["path"] as? String else{return nil};return LocalLibraryModel(path:path,name:v["name"] as? String ?? path,size:(v["size"] as? NSNumber)?.int64Value ?? 0,kind:v["kind"] as? String ?? "text") }
     } catch { notice=error.localizedDescription } } }
     func load(_ path:String) { Task { do { _ = try await model.api("/local/load",["path":path]);try await model.refresh();model.exploreShown=false } catch { notice=error.localizedDescription } } }
     func browse() { let p=NSOpenPanel();p.allowedContentTypes=[UTType(filenameExtension:"gguf") ?? .data];p.canChooseDirectories=false;p.allowsMultipleSelection=false;if p.runModal() == .OK,let u=p.url{load(u.path)} }
@@ -1397,7 +1413,7 @@ struct ModelPickerPopup: View {
             do {
                 if model.snapshot?.settings.provider == "local" {
                     let data=try await model.api("/local/library")
-                    choices=(data["models"] as? [[String:Any]] ?? []).compactMap { $0["path"] as? String }
+                    choices=(data["models"] as? [[String:Any]] ?? []).filter { ($0["kind"] as? String) != "image" }.compactMap { $0["path"] as? String }
                 } else {
                     let data=try await model.api("/models"); choices=data["models"] as? [String] ?? []
                 }
@@ -1422,5 +1438,41 @@ struct ModelPickerPopup: View {
     func browse() {
         let panel=NSOpenPanel(); panel.allowedContentTypes=[UTType(filenameExtension:"gguf") ?? .data]
         if panel.runModal() == .OK, let url=panel.url { select(url.path) }
+    }
+}
+
+
+enum DocumentReader {
+    static func recognize(_ data: Data) throws -> String {
+        let request=VNRecognizeTextRequest();request.recognitionLevel = .accurate
+        request.recognitionLanguages=["ru-RU","en-US"];request.usesLanguageCorrection=true
+        try VNImageRequestHandler(data:data).perform([request])
+        return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator:"\n")
+    }
+    static func extract(_ url: URL) throws -> String {
+        if url.pathExtension.lowercased() != "pdf" {
+            let text=try recognize(Data(contentsOf:url))
+            guard !text.isEmpty else { throw AppError(message:"Текст на картинке не распознан. Описание объектов моделью не подключено.") }
+            return text
+        }
+        guard let doc=PDFDocument(url:url), !doc.isLocked else { throw AppError(message:"PDF не открылся или защищён паролем") }
+        guard doc.pageCount<=400 else { throw AppError(message:"PDF больше 400 страниц; раздели файл. Страницы не обрезаны.") }
+        var result=""
+        for i in 0..<doc.pageCount {
+            let text: String = try autoreleasepool {
+                guard let page=doc.page(at:i) else { throw AppError(message:"Не удалось прочитать страницу \(i+1)") }
+                let embedded=(page.string ?? "").trimmingCharacters(in:.whitespacesAndNewlines)
+                let image=page.thumbnail(of:NSSize(width:1800,height:2400),for:.mediaBox)
+                guard let data=image.tiffRepresentation else { throw AppError(message:"Не удалось распознать страницу \(i+1)") }
+                let recognized=try recognize(data)
+                if embedded.isEmpty { return recognized.isEmpty ? "[Текст не распознан или страница пуста]" : recognized }
+                let known=Set(embedded.components(separatedBy:.newlines).map { $0.trimmingCharacters(in:.whitespaces) })
+                let extra=recognized.components(separatedBy:.newlines).filter { !known.contains($0.trimmingCharacters(in:.whitespaces)) }.joined(separator:"\n")
+                return embedded + (extra.isEmpty ? "" : "\n[Дополнительно распознано на странице]\n"+extra)
+            }
+            result += "[Страница \(i+1)]\n" + text + "\n"
+            guard result.count<=2_000_000 else { throw AppError(message:"Документ больше 2 млн символов; раздели файл. Текст не обрезан.") }
+        }
+        return result
     }
 }
