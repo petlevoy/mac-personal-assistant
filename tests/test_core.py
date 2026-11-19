@@ -61,6 +61,63 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(Store(self.root/'data').chat(self.pid,self.cid)['messages'][-1]['content'],'Привет')
         self.assertNotIn('web_search',[t['function']['name'] for t in FakeModel.bodies[0]['tools']])
         self.assertEqual('run_command' in [t['function']['name'] for t in FakeModel.bodies[0]['tools']],offline_shell_available())
+    def test_attachment_display_persistence_and_model_context(self):
+        files=[{'name':'first.docx','text':'CONFIDENTIAL_BODY'}, {'name':'second.txt','text':'SECOND_BODY'}]
+        self.wait(self.store.start(self.pid,self.cid,'Analyse',attachments=files))
+        message=self.store.chat(self.pid,self.cid)['messages'][0]
+        self.assertEqual(message['displayText'],'Analyse')
+        self.assertEqual([a['name'] for a in message['attachments']],['first.docx','second.txt'])
+        self.assertIn('CONFIDENTIAL_BODY',FakeModel.bodies[0]['messages'][-1]['content'])
+        self.assertEqual(set(FakeModel.bodies[0]['messages'][-1]),{'role','content'})
+        restored=Store(self.root/'data').chat(self.pid,self.cid)['messages'][0]
+        self.assertEqual(restored,message)
+        self.wait(self.store.start(self.pid,self.cid,'Follow up'))
+        self.assertIn('SECOND_BODY',FakeModel.bodies[-1]['messages'][1]['content'])
+
+    def test_attachment_edit_retry_keeps_documents_out_of_question(self):
+        files=[{'name':'source.docx','text':'DOCUMENT_MARKER'}]
+        self.wait(self.store.start(self.pid,self.cid,'Original question',attachments=files))
+        result=self.store.change_chat({'projectID':self.pid,'chatID':self.cid,'action':'edit','index':0,'text':'New question'})
+        self.wait(result['id'])
+        message=self.store.chat(self.pid,self.cid)['messages'][0]
+        self.assertEqual(message['displayText'],'New question')
+        self.assertEqual(message['attachments'][0]['text'],'DOCUMENT_MARKER')
+        self.assertEqual(message['content'].count('DOCUMENT_MARKER'),1)
+        result=self.store.change_chat({'projectID':self.pid,'chatID':self.cid,'action':'retry'})
+        self.wait(result['id'])
+        self.assertEqual(self.store.chat(self.pid,self.cid)['messages'][0]['content'],message['content'])
+        # Attachment-only messages remain editable/retryable without a fake prompt.
+        result=self.store.change_chat({'projectID':self.pid,'chatID':self.cid,'action':'edit','index':0,'text':''})
+        self.wait(result['id'])
+        self.assertEqual(self.store.chat(self.pid,self.cid)['messages'][0]['displayText'],'')
+
+    def test_legacy_attachment_migration_preserves_original(self):
+        legacy='Question\n\n[Файл: old.docx]\nOLD_BODY\n[Конец файла]'
+        chat=self.store.chat(self.pid,self.cid)
+        chat['messages']=[{'role':'user','content':legacy},{'role':'assistant','content':legacy},
+                          {'role':'user','content':'Incomplete\n\n[Файл: bad.docx]\nKEEP_VISIBLE'}]
+        self.store.save()
+        restored=Store(self.root/'data').chat(self.pid,self.cid)['messages']
+        self.assertEqual(restored[0]['content'],legacy)
+        self.assertEqual(restored[0]['displayText'],'Question')
+        self.assertEqual(restored[0]['attachments'][0]['text'],'OLD_BODY')
+        self.assertNotIn('displayText',restored[1])
+        self.assertNotIn('displayText',restored[2])
+        from core import user_message
+        for ambiguous in (legacy+'\nText after file',legacy+'\n[Конец файла]',legacy+'\n\n[Файл: unfinished]'):
+            message=user_message(ambiguous)
+            self.assertEqual(message['content'],ambiguous)
+            self.assertNotIn('displayText',message)
+
+    def test_attachment_metadata_cannot_truncate_or_override_content(self):
+        from core import user_message, MAX_TEXT
+        content='nested\n[Конец файла]\nstill original'
+        message=user_message('Question',[{'name':'source.txt','text':content}])
+        self.assertEqual(message['attachments'][0]['text'],content)
+        self.assertEqual(message['displayText'],'Question')
+        for files in ('bad',[{'name':'a','text':None}],[{'name':'bad\nname','text':'x'}],[{'name':'a','text':'x'*MAX_TEXT}]):
+            with self.assertRaises(ValueError): user_message('',files)
+
     def test_openai_sse(self):
         self.store.update_settings({'provider':'openai'})
         jid=self.store.start(self.pid,self.cid,'hi'); self.wait(jid)
@@ -197,6 +254,27 @@ class CoreTests(unittest.TestCase):
         self.store.update_settings({'toolsEnabled':False})
         jid=self.store.start(self.pid,self.cid,'plain chat'); self.wait(jid)
         self.assertNotIn('tools',FakeModel.bodies[-1])
+    def test_http_send_attachment_separation(self):
+        srv=serve(self.root/'http-files','a'*32)
+        thread=threading.Thread(target=srv.serve_forever,daemon=True); thread.start()
+        base=f'http://127.0.0.1:{srv.server_address[1]}'
+        store=srv.store
+        store.update_settings({'provider':'ollama','baseURL':f'http://127.0.0.1:{self.model.server_address[1]}','model':'mock'})
+        pid=store.data['projects'][0]['id']; cid=store.project(pid)['chats'][0]['id']
+        try:
+            payload={'projectID':pid,'chatID':cid,'text':'Read file','attachments':[{'name':'document.docx','text':'HTTP_BODY_MARKER'}]}
+            request=urllib.request.Request(base+'/send',data=json.dumps(payload).encode(),headers={'X-App-Token':'a'*32,'Content-Type':'application/json'})
+            with urllib.request.urlopen(request) as response: jid=json.load(response)['id']
+            deadline=time.monotonic()+5
+            while store.jobs[jid]['status']=='running' and time.monotonic()<deadline: time.sleep(.01)
+            self.assertEqual(store.jobs[jid]['status'],'done')
+            with urllib.request.urlopen(urllib.request.Request(base+'/state',headers={'X-App-Token':'a'*32})) as response: state=json.load(response)
+            message=state['projects'][0]['chats'][0]['messages'][0]
+            self.assertEqual(message['displayText'],'Read file')
+            self.assertEqual(message['attachments'][0]['text'],'HTTP_BODY_MARKER')
+            self.assertIn('HTTP_BODY_MARKER',FakeModel.bodies[-1]['messages'][-1]['content'])
+        finally: srv.shutdown(); srv.server_close()
+
     def test_server_auth_and_origin(self):
         srv=serve(self.root/'http','a'*32); thread=threading.Thread(target=srv.serve_forever,daemon=True); thread.start()
         base=f'http://127.0.0.1:{srv.server_address[1]}'

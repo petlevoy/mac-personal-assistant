@@ -76,6 +76,7 @@ class LocalModels:
                 if self.state['status']=='loading' or (self.process is not None and self.process.poll() is None): return
             self.close(); self.loaded_context=context; token=self.generation
             if path not in self.known: self.known.append(path)
+            self.load_started=time.monotonic()
             self.persist(); self.state={'status':'loading','path':path,'error':'','size':info['size']}
             threading.Thread(target=self._load,args=(path,context,token),daemon=True).start()
     def _load(self,path,context,token):
@@ -101,7 +102,7 @@ class LocalModels:
                     with urllib.request.urlopen(req,timeout=1) as r:
                         if r.status==200:
                             with self.lock:
-                                if token==self.generation:self.state.update(status='ready',error='')
+                                if token==self.generation:self.state.update(status='ready',error='',loadSeconds=time.monotonic()-self.load_started)
                             return
                 except (OSError,ValueError):pass
                 time.sleep(.5)

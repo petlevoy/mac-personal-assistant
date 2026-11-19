@@ -60,7 +60,7 @@ class FeatureTests(unittest.TestCase):
   c=self.s.chat(self.pid,self.cid);c['messages']=[{'role':'user','content':'old'},{'role':'assistant','content':'answer'}]
   with patch.object(self.s,'start',return_value='job') as start:
    self.s.change_chat({'projectID':self.pid,'chatID':self.cid,'action':'edit','index':0,'text':'new'})
-   start.assert_called_once_with(self.pid,self.cid,'new');self.assertEqual(c['messages'],[])
+   start.assert_called_once_with(self.pid,self.cid,'new',attachments=None);self.assertEqual(c['messages'],[])
   self.assertIn('answer',next((self.s.root/'archives').glob('*.json')).read_text())
  def test_search_providers_and_missing_keys(self):
   for provider,payload in [('brave',{'web':{'results':[{'title':'t','url':'u'}]}}),('tavily',{'results':[{'title':'t','url':'u'}]}),('serper',{'organic':[{'title':'t','link':'u'}]})]:

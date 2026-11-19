@@ -18,6 +18,44 @@ def atomic_json(path, value):
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
+def user_message(text, attachments=None):
+    """Keep model input intact while storing a separate, compact chat presentation.
+
+    Older clients persisted inline file blocks. Recognize complete blocks only;
+    malformed/ambiguous text remains visible and is never discarded.
+    """
+    if not isinstance(text,str): raise ValueError('Текст сообщения должен быть строкой')
+    display=text
+    if attachments is None:
+        pattern=re.compile(r'\n\n\[Файл: ([^\n]+)\]\n(.*?)\n\[Конец файла\]',re.S)
+        matches=list(pattern.finditer(text))
+        # Only migrate the complete suffix emitted by the former composer.
+        # Embedded marker examples or partial blocks must not change edit/retry input.
+        if matches and (text[matches[-1].end():].strip()
+                        or any(text[a.end():b.start()].strip() for a,b in zip(matches,matches[1:]))
+                        or text.count('\n[Конец файла]') != len(matches)
+                        or text.count('\n\n[Файл: ') != len(matches)):
+            matches=[]
+        attachments=[{'id':uid(),'name':m[1],'text':m[2]} for m in matches]
+        display=text[:matches[0].start()] if matches else text
+        content=text
+    else:
+        if not isinstance(attachments,list) or len(attachments)>100:
+            raise ValueError('Некорректный список вложений')
+        clean=[]
+        for item in attachments:
+            if not isinstance(item,dict) or not isinstance(item.get('name'),str) or not isinstance(item.get('text'),str):
+                raise ValueError('Некорректное вложение')
+            if not item['name'].strip() or '\n' in item['name'] or '\r' in item['name']:
+                raise ValueError('Некорректное имя вложения')
+            clean.append({'id':uid(),'name':item['name'],'text':item['text']})
+        attachments=clean
+        content=text+''.join('\n\n[Файл: '+a['name']+']\n'+a['text']+'\n[Конец файла]' for a in attachments)
+    if len(content)>MAX_TEXT: raise ValueError('Сообщение больше 2 000 000 символов; раздели его. Текст не обрезан.')
+    message={'role':'user','content':content}
+    if attachments: message.update(displayText=display,attachments=attachments)
+    return message
+
 def estimate_tokens(messages):
     return sum((len(json.dumps(m, ensure_ascii=False).encode('utf-8')) + 3) // 4 for m in messages)
 
@@ -78,21 +116,35 @@ def extract_text(path):
             if 'xl/sharedStrings.xml' in z.namelist():
                 strings = [''.join(e.itertext()) for e in ET.fromstring(zip_member(z,'xl/sharedStrings.xml')).findall('s:si',ns)]
             out=[]
-            sheets=sorted(n for n in z.namelist() if re.fullmatch(r'xl/worksheets/sheet\d+\.xml',n))
+            sheets=sorted((n for n in z.namelist() if re.fullmatch(r'xl/worksheets/sheet\d+\.xml',n)),key=lambda n:int(re.search(r'(\d+)\.xml',n).group(1)))
+            labels={}
+            if 'xl/workbook.xml' in z.namelist() and 'xl/_rels/workbook.xml.rels' in z.namelist():
+                import posixpath
+                rels={r.get('Id'):posixpath.normpath(posixpath.join('xl',r.get('Target',''))) if not r.get('Target','').startswith('/') else r.get('Target').lstrip('/') for r in ET.fromstring(zip_member(z,'xl/_rels/workbook.xml.rels')) if r.get('TargetMode')!='External'}
+                ordered=[]
+                for sheet in ET.fromstring(zip_member(z,'xl/workbook.xml')).findall('s:sheets/s:sheet',ns):
+                    name=rels.get(sheet.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id'))
+                    if name in sheets:
+                        ordered.append(name);labels[name]=sheet.get('name',name)
+                sheets=ordered+[n for n in sheets if n not in ordered]
             if len(sheets)>100: raise ValueError('Слишком много листов')
             for name in sheets:
-                out.append('['+name+']')
+                out.append('[Лист: '+labels.get(name,name)+']')
                 for row in ET.fromstring(zip_member(z,name)).findall('.//s:row',ns):
                     cells=[]
                     for c in row.findall('s:c',ns):
                         v=c.find('s:v',ns)
                         value=v.text if v is not None and v.text else ''
                         if c.get('t')=='s': value=strings[int(value)] if value else ''
-                        if c.get('t')=='inlineStr': value=''.join(c.find('s:is',ns).itertext())
+                        if c.get('t')=='inlineStr':
+                            inline=c.find('s:is',ns);value=''.join(inline.itertext()) if inline is not None else ''
+                        formula=c.find('s:f',ns)
+                        if formula is not None:
+                            value += ' [формула: ='+(formula.text or '')+'; '+('сохранённое значение выше' if v is not None else 'сохранённого значения нет')+']'
                         cells.append(c.get('r','')+'='+value)
                     out.append('\t'.join(cells))
             text='\n'.join(out)
-    elif suffix in ('.txt','.md','.csv','.json','.py','.swift','.html','.log','.xml','.yaml','.yml'):
+    elif suffix in ('.txt','.md','.csv','.json','.py','.swift','.html','.log','.xml','.yaml','.yml','.tsv'):
         text=p.read_text(encoding='utf-8-sig')
     else:
         raise ValueError('Этот формат читает Mac-клиент (PDF/OCR) либо он не поддержан')
@@ -167,6 +219,8 @@ class Store(Features):
         self.lock=threading.RLock(); self.secrets={}; self.jobs={}; self.pending={}; self.responses={}
         self.active_response=None
         self.local=LocalModels(self.root)
+        from engines import EngineManager
+        self.engine=EngineManager(self); self.queue=[]; self.queued_inputs={}; self.worker=None
         self.path=self.root/'state.json'
         if self.path.exists(): self.data=json.loads(self.path.read_text())
         else:
@@ -187,6 +241,8 @@ class Store(Features):
             for c in p['chats']:
                 for m in c['messages']:
                     if m.pop('streaming',False): m['content'] += '\n[Ответ прерван закрытием приложения]'
+                    if m.get('role')=='user' and 'displayText' not in m:
+                        m.update(user_message(m['content']))
                 pending_calls={}
                 for m in c['messages']:
                     for call in m.get('tool_calls',[]): pending_calls[call['id']]=call['function']['name']
@@ -222,6 +278,7 @@ class Store(Features):
             result=copy.deepcopy(self.data)
             from telemetry import temperatures
             self.thermal.update(temperatures())
+            result['engine']=self.engine.snapshot()
             result['usage']=dict(self.usage); result['thermal']=dict(self.thermal)
             for p in result['projects']:
                 for s in p['skills']: s.pop('text',None)
@@ -241,7 +298,7 @@ class Store(Features):
             return result
     def update_settings(self,settings):
         allowed={'imageProvider','imageLocalModel','imageWidth','imageHeight','imageSteps','imageCFG','imageCompute','imageEnabled','imageBaseURL','imageModel','mode','provider','baseURL','model','contextLimit','temperature','toolsEnabled','searchProvider','thermalEnabled','thermalLimit'}
-        if any(j['status']=='running' for j in self.jobs.values()): raise ValueError('Сначала останови генерацию')
+        if any(j['status'] in ('running','queued') for j in self.jobs.values()): raise ValueError('Сначала останови генерацию и очередь')
         with self.lock:
             new={**self.data['settings'],**{k:v for k,v in settings.items() if k in allowed}}
             if new['provider']!='local': validate_endpoint(new['baseURL'],new['mode'],new['provider'])
@@ -262,6 +319,7 @@ class Store(Features):
             new['thermalEnabled']=bool(new.get('thermalEnabled',False))
             new['thermalLimit']=max(45,min(float(new.get('thermalLimit',80)),100))
             self.data['settings']=new
+            if self.engine.last.get('provider')!=new['provider'] or self.engine.last.get('model')!=new['model']: self.engine.last={}
             selected=pathlib.Path(new.get('model','')).expanduser()
             if new['provider']=='local' and selected.is_file() and selected.suffix.lower()=='.gguf':
                 from local_models import gguf_info
@@ -311,27 +369,48 @@ class Store(Features):
         for original,wire in zip(c['messages'],history):
             if original.get('contextContent'): wire['content']=original['contextContent']
         return [{'role':'system','content':system}]+history
-    def start(self,pid,cid,text,compact=False):
+    def start(self,pid,cid,text,compact=False,attachments=None):
         with self.lock:
-            if any(j['status']=='running' for j in self.jobs.values()): raise ValueError('Сначала останови текущую генерацию')
+            if any(j['status'] in ('running','queued') and (j.get('directImage') or j['chatID']==cid) for j in self.jobs.values()): raise ValueError('В этом чате уже есть запрос. Дождись ответа или отмени его.')
+            if len(self.queue)>=20: raise ValueError('Очередь заполнена (20 запросов)')
             s=self.data['settings']
             if s['provider']!='local': validate_endpoint(s['baseURL'],s['mode'],s['provider'])
             if not s['model'].strip(): raise ValueError('Выбери модель в настройках')
             c=self.chat(pid,cid)
             if not compact:
+                message=user_message(text,attachments)
+                text=message['content']
                 if not text.strip(): raise ValueError('Пустое сообщение')
-                if len(text)>MAX_TEXT: raise ValueError('Сообщение больше 2 000 000 символов; раздели его. Текст не обрезан.')
-                c['messages'].append({'role':'user','content':text})
+                c['messages'].append(message)
                 if c['title']=='Новый чат': c['title']=text[:50]
             messages=self.prepare_messages(pid,cid)
             document_mode=not compact and (len(text)>60000 or (context_size(messages,s)>s['contextLimit']-512 and '[Файл: ' in text))
             if not document_mode and context_size(messages,s)>s['contextLimit']-512:
                 # Keep user message, but don't send an unexpectedly enormous request.
                 self.save(); raise ValueError('Оценка контекста превышает лимит. Создай новый чат или увеличь лимит. История сохранена.')
-            jid=uid(); j={'id':jid,'projectID':pid,'chatID':cid,'status':'running','error':'','stop':threading.Event(),'compact':compact,'documentMode':document_mode}
-            self.jobs={jid:j}; self.save()
-            threading.Thread(target=self.run,args=(jid,copy.deepcopy(s),messages),daemon=True).start()
+            jid=uid(); j={'id':jid,'projectID':pid,'chatID':cid,'status':'queued' if any(v['status'] in ('running','queued') for v in self.jobs.values()) else 'running','error':'','stop':threading.Event(),'compact':compact,'documentMode':document_mode}
+            self.jobs={k:v for k,v in self.jobs.items() if v['status'] in ('running','queued') or k in self.queue} | {jid:j}; self.save()
+            self.queue.append(jid); self.queued_inputs[jid]=(copy.deepcopy(s),messages)
+            if self.worker is None or not self.worker.is_alive():
+                self.worker=threading.Thread(target=self.drain_queue,daemon=True); self.worker.start()
             return jid
+    def drain_queue(self):
+        while True:
+            with self.lock:
+                if not self.queue:
+                    self.worker=None
+                    return
+                jid=self.queue.pop(0); settings,messages=self.queued_inputs.pop(jid)
+                job=self.jobs[jid]
+                if job['stop'].is_set():
+                    job['status']='stopped'; job['error']='Отменено в очереди'
+                    continue
+                job['status']='running'
+            self.run(jid,settings,messages)
+    def engine_action(self,action):
+        with self.lock:
+            self.idle()
+            self.engine.lifecycle(action)
     def start_image(self,pid,cid,text):
         with self.lock:
             self.idle()
@@ -365,10 +444,12 @@ class Store(Features):
                 chat['messages'].append({'role':'tool','name':'generate_image','tool_call_id':callid,'content':json.dumps(result,ensure_ascii=False)})
                 if status!='done': chat['messages'].append({'role':'assistant','content':job['error']})
                 job['status']=status; self.save()
-    def stop(self):
+    def stop(self,jid=None):
         with self.lock:
             for j in self.jobs.values():
-                if j['status']=='running': j['stop'].set()
+                if j['status'] in ('running','queued') and (jid is None or j['id']==jid):
+                    j['stop'].set()
+                    if j['status']=='queued': j['status']='stopped'; j['error']='Отменено в очереди'
     def approval_key(self,payload):
         name=payload['tool']
         if name in ('mcp_list','mcp_call'):
@@ -538,25 +619,17 @@ class Store(Features):
                 if not approval.get('approved'): return {'status':'rejected'}
             return self.await_action(j,'browser',{'action':name,'url':args.get('url',''),'arguments':args})
     def stream_model(self,s,messages,stop,callback,tools_enabled=True):
+        from engines import ADAPTERS
+        started=time.monotonic(); first_text=None; eval_seconds=None
+        provider=s['provider']; requested_model=s['model']; adapter=ADAPTERS[provider]
         tools_enabled = tools_enabled and s.get('toolsEnabled', True)
-        key=self.secrets.get('model',''); local_provider=s['provider']=='local'
+        key=self.secrets.get('model',''); local_provider=provider=='local'
         if local_provider:
             base,key=self.local.endpoint(s['model'],s['contextLimit'],stop)
             s={**s,'provider':'openai','baseURL':base,'model':'local-model'}
         else: base=validate_endpoint(s['baseURL'],s['mode'],s['provider'])
-        tool_list=available_tools(s)
-        if s['provider']=='ollama':
-            body={'model':s['model'],'messages':messages,'stream':True,'options':{'temperature':s['temperature'],'num_ctx':s['contextLimit']}}
-            if tools_enabled: body['tools']=tool_list
-            url=base+'/api/chat'
-        else:
-            body={'model':s['model'],'messages':messages,'stream':True,'stream_options':{'include_usage':True},'temperature':s['temperature']}
-            if tools_enabled: body['tools']=tool_list
-            url=base+'/chat/completions'
-            if local_provider: body['chat_template_kwargs']={'enable_thinking':False}
-        if '_maxOutputTokens' in s:
-            if s['provider']=='ollama': body['options']['num_predict']=s['_maxOutputTokens']
-            else: body['max_tokens']=s['_maxOutputTokens']
+        path,body=adapter.request(s,messages,available_tools(s) if tools_enabled else None)
+        url=base+path; request_started=time.monotonic()
         text=''; calls={}; finished=threading.Event(); reported_usage=None
         from telemetry import thermal_guard
         thermal_thread=None
@@ -581,30 +654,14 @@ class Store(Features):
                     if stop.is_set(): raise InterruptedError('Остановлено')
                     line=raw.decode('utf-8').strip()
                     if not line: continue
-                    if s['provider']=='openai':
-                        if not line.startswith('data:'): continue
-                        line=line[5:].strip()
-                        if line=='[DONE]': break
-                        data=json.loads(line)
-                        if data.get('error'): raise ValueError('Ошибка сервера модели')
-                        if isinstance(data.get('usage'),dict): reported_usage=data['usage']
-                        choices=data.get('choices',[])
-                        if not choices: continue
-                        if '_maxOutputTokens' in s and choices[0].get('finish_reason')=='length': raise ValueError('Модель исчерпала лимит ответа при анализе. Результат неполон; увеличь контекст или уточни задание.')
-                        delta=choices[0].get('delta',{})
-                        for t in delta.get('tool_calls',[]):
-                            i=t.get('index',0); c=calls.setdefault(i,{'id':t.get('id') or uid(),'type':'function','function':{'name':'','arguments':''}})
-                            f=t.get('function',{}); c['function']['name']+=f.get('name',''); c['function']['arguments']+=f.get('arguments','')
-                    else:
-                        data=json.loads(line)
-                        if data.get('error'): raise ValueError('Ошибка сервера Ollama: '+str(data['error'])[:300])
-                        if data.get('done') and 'prompt_eval_count' in data and 'eval_count' in data: reported_usage={'prompt_tokens':data['prompt_eval_count'],'completion_tokens':data['eval_count']}
-                        if '_maxOutputTokens' in s and data.get('done_reason')=='length': raise ValueError('Модель исчерпала лимит ответа при анализе. Результат неполон.')
-                        delta=data.get('message',{})
-                        for t in delta.get('tool_calls',[]):
-                            f=t.get('function',{})
-                            calls[len(calls)]={'id':uid(),'type':'function','function':{'name':f.get('name',''),'arguments':json.dumps(f.get('arguments',{}),ensure_ascii=False)}}
-                    part=delta.get('content') or ''
+                    chunk=adapter.chunk(line,calls)
+                    if chunk is None: continue
+                    if chunk.get('done'): break
+                    if chunk.get('usage') is not None: reported_usage=chunk['usage']
+                    if chunk.get('evalSeconds'): eval_seconds=chunk['evalSeconds']
+                    if '_maxOutputTokens' in s and chunk.get('length'): raise ValueError('Модель исчерпала лимит ответа при анализе. Результат неполон; увеличь контекст или уточни задание.')
+                    part=chunk.get('text','')
+                    if part and first_text is None: first_text=time.monotonic()
                     text+=part
                     if len(text)>200000: raise ValueError('Ответ превысил лимит 200000 символов')
                     callback(part)
@@ -634,6 +691,16 @@ class Store(Features):
                 if reported_usage is not None and isinstance(reported_usage.get('prompt_tokens'),int) and isinstance(reported_usage.get('completion_tokens'),int):
                     self.usage['inputTokens']+=max(0,reported_usage['prompt_tokens']); self.usage['outputTokens']+=max(0,reported_usage['completion_tokens']); self.usage['reportedRequests']+=1
                 else: self.usage['missingRequests']+=1
+                elapsed=time.monotonic()-request_started
+                count=reported_usage.get('completion_tokens') if isinstance(reported_usage,dict) else None
+                valid=isinstance(count,int) and not isinstance(count,bool) and count>=0
+                # Explicit denominator: provider eval time when supplied, otherwise whole HTTP request.
+                seconds=eval_seconds if eval_seconds and eval_seconds>0 else elapsed
+                self.engine.last={'provider':provider,'model':requested_model, 'firstTextSeconds':first_text-started if first_text is not None else None,
+                    'requestSeconds':elapsed,'outputTokens':count if valid else None,
+                    'tokensPerSecond':count/seconds if valid and seconds>0 else None,
+                    'rateBasis':'provider_eval' if eval_seconds else 'whole_request'}
+
     def run(self,jid,s,messages):
         j=self.jobs[jid]; pid=j['projectID']; cid=j['chatID']; stop=j['stop']
         try:

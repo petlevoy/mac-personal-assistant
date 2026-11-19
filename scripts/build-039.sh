@@ -4,10 +4,12 @@ export PYTHONDONTWRITEBYTECODE=1
 cd "$(dirname "$0")/.."
 mkdir -p build dist
 app="$PWD/build/Inij.app"
-if [[ ! -d "$app" ]]; then ditto /Users/viktor/Inij-local-images-038/source/build/Inij.app "$app"; fi
+if [[ ! -d "$app" ]]; then ditto /Applications/Inij.app "$app"; fi
 cp backend/*.py "$app/Contents/Resources/backend/"
 cp macos/Info.plist "$app/Contents/Info.plist"
 python_bin="$app/Contents/Resources/python/bin/python3"
+version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' macos/Info.plist)"
+dmg="Inij-${version}-arm64.dmg"
 "$python_bin" -I -B -m unittest discover -s tests -v
 if [[ "${PACKAGE_ONLY:-0}" != 1 ]]; then
 xcrun --sdk macosx swiftc -swift-version 5 -parse-as-library -O -target arm64-apple-macosx13.0 macos/Assistant.swift macos/SmokeTest.swift -o "$app/Contents/MacOS/PersonalAssistant" -framework SwiftUI -framework AppKit -framework WebKit -framework Security -framework PDFKit -framework Vision
@@ -24,9 +26,9 @@ fi
 stage="$(mktemp -d "$PWD/build/dmg-stage.XXXXXX")"
 ditto "$app" "$stage/Inij.app"
 ln -s /Applications "$stage/Applications"
-hdiutil create -ov -volname Inij -srcfolder "$stage" -format UDZO "$PWD/dist/Inij-0.3.9-arm64.dmg"
-"$python_bin" -I -B scripts/verify_installer.py "$PWD/dist/Inij-0.3.9-arm64.dmg" "$PWD/build/installed-final.json"
+hdiutil create -ov -volname Inij -srcfolder "$stage" -format UDZO "$PWD/dist/${dmg}"
+"$python_bin" -I -B scripts/verify_installer.py "$PWD/dist/${dmg}" "$PWD/build/installed-final.json"
 codesign --verify --deep --strict "$app"
-cp "$PWD/dist/Inij-0.3.9-arm64.dmg" /Users/viktor/Desktop/Inij-0.3.9-arm64.dmg
-shasum -a 256 "$PWD/dist/Inij-0.3.9-arm64.dmg" /Users/viktor/Desktop/Inij-0.3.9-arm64.dmg
-stat -f '%z %N' /Users/viktor/Desktop/Inij-0.3.9-arm64.dmg
+cp "$PWD/dist/${dmg}" /Users/viktor/Desktop/${dmg}
+shasum -a 256 "$PWD/dist/${dmg}" /Users/viktor/Desktop/${dmg}
+stat -f '%z %N' /Users/viktor/Desktop/${dmg}

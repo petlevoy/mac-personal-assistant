@@ -83,9 +83,11 @@ class Handler(BaseHTTPRequestHandler):
                 m=s.prepare_messages(data['projectID'],data['chatID'])
                 return self.send_json({'estimatedTokens':context_size(m,s.data['settings']),'method':'UTF-8 bytes / 4; approximate','messages':m})
             elif self.path=='/image/generate': return self.send_json({'id':s.start_image(data['projectID'],data['chatID'],data['text'])})
-            elif self.path=='/send': return self.send_json({'id':s.start(data['projectID'],data['chatID'],data['text'])})
+            elif self.path=='/send': return self.send_json({'id':s.start(data['projectID'],data['chatID'],data['text'],attachments=data.get('attachments'))})
             elif self.path=='/compact': return self.send_json({'id':s.start(data['projectID'],data['chatID'],'',True)})
-            elif self.path=='/stop': s.stop()
+            elif self.path=='/engine/load': s.engine_action('load')
+            elif self.path=='/engine/unload': s.engine_action('unload')
+            elif self.path=='/stop': s.stop(data.get('id'))
             elif self.path=='/permissions/reset': s.reset_permissions()
             elif self.path=='/resolve': s.resolve(data['id'],data['response'])
             elif self.path=='/artifact/path': return self.send_json({'path':s.artifact_path(data['projectID'],data['path'])})
@@ -94,11 +96,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not source.is_file() or source.stat().st_size>MAX_FILE: raise ValueError('Выбери файл до 12 МБ')
                 s.project(data['projectID']) # validate project before any write
                 folder=s.root/'projects'/data['projectID']/'files'; folder.mkdir(parents=True,exist_ok=True)
-                target=folder/(uid()[:8]+'-'+source.name); shutil.copy2(source,target)
+                target=folder/(uid()[:8]+'-'+source.name)
                 if 'extractedText' in data:
                     text=str(data['extractedText']); truncated=False
                     if len(text)>2_000_000: raise ValueError('Документ больше 2 000 000 символов. Текст не был обрезан.')
-                else: text,truncated=extract_text(target)
+                else: text,truncated=extract_text(source)
+                if not text.strip(): raise ValueError('В файле нет читаемого текста. Вложение не добавлено.')
+                if truncated: raise ValueError('Файл прочитан не полностью. Вложение не добавлено.')
+                shutil.copy2(source,target)
                 return self.send_json({'text':text,'truncated':truncated,'name':source.name,'storedPath':str(target)})
             elif self.path=='/chat/export':
                 with s.lock:

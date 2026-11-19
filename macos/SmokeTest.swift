@@ -40,7 +40,22 @@ extension View {
         view.layoutSubtreeIfNeeded()
         guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { throw AppError(message: "Window bitmap unavailable") }
         view.cacheDisplay(in: view.bounds, to: bitmap)
-        guard let data = bitmap.representation(using: .png, properties: [:]) else { throw AppError(message: "Window PNG unavailable") }
+        // NSHostingView's cache has transparent backgrounds. Flatten against the
+        // actual window background, otherwise viewers ignoring PNG alpha show
+        // white button silhouettes and hide their labels.
+        guard let opaque = NSBitmapImageRep(bitmapDataPlanes:nil,pixelsWide:bitmap.pixelsWide,pixelsHigh:bitmap.pixelsHigh,bitsPerSample:8,samplesPerPixel:4,hasAlpha:true,isPlanar:false,colorSpaceName:.deviceRGB,bytesPerRow:0,bitsPerPixel:0),
+              let context = NSGraphicsContext(bitmapImageRep:opaque) else { throw AppError(message:"Opaque window bitmap unavailable") }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        let bounds = NSRect(x:0,y:0,width:bitmap.pixelsWide,height:bitmap.pixelsHigh)
+        target.effectiveAppearance.performAsCurrentDrawingAppearance {
+            NSColor.windowBackgroundColor.setFill(); bounds.fill()
+        }
+        let snapshot = NSImage(size:bounds.size)
+        snapshot.addRepresentation(bitmap)
+        snapshot.draw(in:bounds,from:.zero,operation:.sourceOver,fraction:1)
+        NSGraphicsContext.restoreGraphicsState()
+        guard let data = opaque.representation(using:.png,properties:[:]) else { throw AppError(message:"Window PNG unavailable") }
         try data.write(to: URL(fileURLWithPath: reportPath + "-" + suffix + ".png"))
     }
     do {
@@ -86,6 +101,7 @@ extension View {
         UserDefaults.standard.set(false,forKey:"enterSends")
         try require(!UserDefaults.standard.bool(forKey:"enterSends"), "composer preference persisted")
         if let saved=savedEnter { UserDefaults.standard.set(saved,forKey:"enterSends") } else { UserDefaults.standard.removeObject(forKey:"enterSends") }
+        try require(model.snapshot?.engine != nil, "engine state and optional metrics decoded by native UI")
         try require(model.snapshot?.usage != nil && model.snapshot?.thermal != nil, "native telemetry decoded, absent sensors remain optional")
         if let flag = CommandLine.arguments.firstIndex(of: "--chat-model"), CommandLine.arguments.count > flag + 1 {
             let path = CommandLine.arguments[flag+1]
@@ -144,7 +160,16 @@ extension View {
         try await Task.sleep(nanoseconds:700_000_000)
         try require(!window.sheets.isEmpty, "updated settings sheet opens")
         model.settingsShown = false
+        // Let SwiftUI finish dismissing Settings before any next presentation or window test.
+        // The no-capture LaunchServices path previously raced the sheet transition.
+        for _ in 0..<40 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if window.sheets.isEmpty { break }
+        }
+        try require(window.sheets.isEmpty, "settings sheet dismisses before subsequent controls")
         model.polling?.cancel()
+        await model.polling?.value
+        try require(model.error.isEmpty, "cancelled polling does not present a connection-error alert")
         if !CommandLine.arguments.contains("--skip-capture") {
         model.snapshot?.settings.model="/Models/Very-Long-Model-Repository/Qwen3-27B-Turbo-Fusion-Example-Uncensored-Coder-MAX-Q4_K_M.gguf"
         window.setContentSize(NSSize(width:900,height:650))
@@ -193,6 +218,9 @@ extension View {
         store.write("", "p","a")
         try require(reloaded.read("p","a").isEmpty && reloaded.read("p","b") == "Второй", "sending one draft does not clear another")
         let pid = model.projectID; let cid = model.chatID
+        let originalAttachments = model.attachments
+        store.writeAttachments([ComposerAttachment(id:"fixture",name:"test.txt",text:"complete source")],"p","a")
+        try require(reloaded.attachments("p","a").first?.text == "complete source" && reloaded.attachments("p","b").isEmpty,"attachment drafts persist separately by chat")
         let originalDraft = model.draft
         model.draft = "Draft A"
         model.chatID = "smoke-alternate-chat"
@@ -211,10 +239,13 @@ extension View {
         pasteboard.releaseGlobally()
         model.attach(attachmentURL)
         for _ in 0..<30 {
-            if model.draft.contains("Содержимое перетаскиваемого файла") { break }
+            if model.attachments.contains(where: { $0.text.contains("Содержимое перетаскиваемого файла") }) { break }
             try await Task.sleep(nanoseconds:100_000_000)
         }
-        try require(model.draft.contains("Содержимое перетаскиваемого файла"), "dropped-file import path extracts text into current draft")
+        try require(model.attachments.contains(where: { $0.text.contains("Содержимое перетаскиваемого файла") }), "dropped file is extracted into separate composer attachment")
+        try require(model.draft == originalDraft,"attachment does not dump contents into question field")
+        if !CommandLine.arguments.contains("--skip-capture") { try capture("composer-attachment",window) }
+        model.attachments = originalAttachments
         model.draft = originalDraft
         let transcript = ChatTranscript.textView(title:"Проверка PDF",messages:[ChatMessage(role:"assistant",content:markdownFixture)],size:14)
         let pdf = transcript.dataWithPDF(inside:transcript.bounds)
@@ -298,36 +329,77 @@ extension View {
         // Exercise the actual SwiftUI controls with hit-tested mouse events, not the model closure.
         func clickControl(_ identifier: String, in target: NSWindow? = nil) async throws {
             let window = target ?? window
+            // Activation can relayout SwiftUI; resolve the hit point only afterwards.
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            try await Task.sleep(nanoseconds: 500_000_000)
             window.contentView?.layoutSubtreeIfNeeded()
             guard let root = window.contentView, let anchor = SmokeControlView.controls.object(forKey: identifier as NSString), anchor.window === window else {
                 throw AppError(message: "Control not mounted in the expected window: " + identifier)
             }
+            // A mounted LazyVStack row can be outside the scroll viewport (e.g.
+            // after auto-scroll to the assistant reply). Reveal it before hit-testing.
+            if identifier.hasPrefix("sent.attachment.") {
+                anchor.scrollToVisible(anchor.bounds)
+                try await Task.sleep(nanoseconds: 300_000_000)
+                window.contentView?.layoutSubtreeIfNeeded()
+                let visible = anchor.bounds.intersection(anchor.visibleRect)
+                try require(visible.width > 10 && visible.height > 10, identifier + " is inside its scroll viewport")
+                try capture("attachment-before-click",window)
+            }
             let rect = anchor.convert(anchor.bounds, to: nil)
             try require(rect.width > 10 && rect.height > 10, identifier + " has a visible click target")
+            report["display_diagnostic"] = ["windowFrame":NSStringFromRect(window.frame),"screens":NSScreen.screens.map { NSStringFromRect($0.frame) },"mouse":NSStringFromPoint(NSEvent.mouseLocation),"windowMouse":NSStringFromPoint(window.mouseLocationOutsideOfEventStream),"mainDisplay":CGMainDisplayID()]
             let point = NSPoint(x: identifier == "settings.tools" ? rect.maxX - 8 : rect.midX, y: rect.midY)
             guard let hit = root.hitTest(root.convert(point, from: nil)), !hit.isHidden else {
                 throw AppError(message: "Control is not hit-testable: " + identifier)
             }
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            try await Task.sleep(nanoseconds: 200_000_000)
             guard let down = NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1),
                   let up = NSEvent.mouseEvent(with: .leftMouseUp, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime + 0.05, windowNumber: window.windowNumber, context: nil, eventNumber: 2, clickCount: 1, pressure: 0) else {
                 throw AppError(message: "Cannot create control mouse events")
             }
-            // sendEvent routes through the window's real hit test. Queue the matching
-            // mouse-up first so AppKit's synchronous button tracking can consume it.
-            NSApp.postEvent(up, atStart: true)
-            window.sendEvent(down)
-            window.sendEvent(up)
+            // Queueing NSEvent re-encodes Cocoa coordinates via the display
+            // origin. A VM with active display 1 but primary display ID 0 shifted
+            // y=624 to -506. Normalize Quartz coordinates before that round-trip.
+            // Preserve real application/window hit-testing, never invoke actions.
+            func queued(_ event: NSEvent) throws -> NSEvent {
+                let screenPoint = window.convertPoint(toScreen:point)
+                let expected = NSPoint(x:screenPoint.x,y:CGDisplayBounds(CGMainDisplayID()).height - screenPoint.y)
+                guard let cg = event.cgEvent else { throw AppError(message:"Mouse event has no Quartz representation") }
+                let offset = NSPoint(x:cg.location.x - expected.x,y:cg.location.y - expected.y)
+                report["event_queue_offset"] = NSStringFromPoint(offset)
+                guard let result = NSEvent.mouseEvent(with:event.type,location:NSPoint(x:point.x-offset.x,y:point.y+offset.y),modifierFlags:[],timestamp:event.timestamp,windowNumber:window.windowNumber,context:nil,eventNumber:event.eventNumber,clickCount:1,pressure:event.pressure) else { throw AppError(message:"Cannot normalize queued mouse event") }
+                return result
+            }
+            if identifier == "model.delete" || identifier == "settings.tools" {
+                // AppKit list-cell buttons and native checkboxes synchronously
+                // track the matching release in a nested event loop.
+                NSApp.postEvent(try queued(up),atStart:true)
+                window.sendEvent(down)
+            } else {
+                // SwiftUI gesture controls do not need nested event tracking.
+                // Keep both events window-local, avoiding queue re-encoding.
+                NSApp.sendEvent(down)
+                try await Task.sleep(nanoseconds:150_000_000)
+                NSApp.sendEvent(up)
+            }
             var trace = report["mouse_events"] as? [String] ?? []
             trace.append(identifier + " " + NSStringFromRect(rect) + " hit=" + String(describing: type(of: hit)))
             report["mouse_events"] = trace
             try await Task.sleep(nanoseconds: 500_000_000)
         }
+        var observedEvents:[String]=[]
+        let eventMonitor = NSEvent.addLocalMonitorForEvents(matching:[.leftMouseDown,.leftMouseUp,.mouseMoved]) { event in
+            observedEvents.append("type=\(event.type.rawValue) location=\(NSStringFromPoint(event.locationInWindow)) window=\(event.windowNumber) currentMouse=\(NSStringFromPoint(NSEvent.mouseLocation))")
+            return event
+        }
+        defer { if let monitor=eventMonitor { NSEvent.removeMonitor(monitor) } }
         model.showBrowser = false
         try await Task.sleep(nanoseconds: 400_000_000)
         try await clickControl("browser.toggle")
+        report["observed_events"] = observedEvents
+        report["browser_open_state"] = ["showBrowser":model.showBrowser,"attached":model.browser.webView.window === window,"active":NSApp.isActive,"key":window.isKeyWindow,"sheets":window.sheets.count,"width":window.frame.width,"settingsShown":model.settingsShown,"exploreShown":model.exploreShown,"error":model.error,"sheetTitles":window.sheets.map { $0.title }]
+        if !window.sheets.isEmpty { try? capture("blocking-sheet",window.sheets[0]) }
         try require(model.showBrowser && model.browser.webView.window === window, "mouse click opens embedded browser")
         // Closing is also available offline; it only hides the panel and preserves its page.
         model.browser.enabled = false
@@ -379,12 +451,28 @@ extension View {
             try require(model.snapshot?.jobs.first(where: { $0.id == active.id })?.status == "running", "closing settings does not stop the running generation")
             let busySettings = try JSONSerialization.data(withJSONObject: (try await model.api("/state"))["settings"] ?? [:], options: .sortedKeys)
             try require(initialSettings == busySettings, "closing busy settings leaves saved parameters unchanged")
+            let activeChat=model.chatID
+            let nextChat=try await model.api("/chat",["projectID":model.projectID])
+            model.chatID=nextChat["id"] as! String
+            try await model.refresh()
+            model.draft="Queued native request"
+            try require(model.canSend, "native composer accepts another chat while engine is busy")
+            model.send()
+            for _ in 0..<30 { try await Task.sleep(nanoseconds:100_000_000); try await model.refresh(); if model.snapshot?.jobs.contains(where: { $0.status == "queued" }) == true { break } }
+            guard let queued=model.snapshot?.jobs.first(where: { $0.status == "queued" }) else { throw AppError(message:"Native send did not queue") }
+            try require(model.chatBusy && !model.canSend, "queued chat prevents duplicate submission")
+            if !CommandLine.arguments.contains("--skip-capture") { try capture("engine-queue", window) }
+            model.cancelJob(queued.id)
+            for _ in 0..<20 { try await Task.sleep(nanoseconds:100_000_000); try await model.refresh(); if model.snapshot?.jobs.first(where: { $0.id == queued.id })?.status == "stopped" { break } }
+            try require(model.snapshot?.jobs.first(where: { $0.id == queued.id })?.status == "stopped", "native cancel removes queued job without stopping active job")
+            model.chatID=activeChat
             for _ in 0..<160 {
                 try await Task.sleep(nanoseconds:100_000_000)
                 try await model.refresh()
                 if !model.running { break }
             }
             try require(model.snapshot?.jobs.first(where: { $0.id == active.id })?.status == "done", "same generation completes after settings dismissal")
+            try require((model.snapshot?.engine?.metrics.firstTextSeconds ?? 0)>0 && model.snapshot?.engine?.metrics.tokensPerSecond == nil, "native metrics show measured first text and no invented tokens per second")
             try require(model.chat?.messages.last?.content.contains("STREAM_COMPLETED") == true, "remaining streaming response reaches chat after closing settings")
         }
         if let flag=CommandLine.arguments.firstIndex(of:"--documents-smoke-base"),CommandLine.arguments.count>flag+1 {
@@ -405,25 +493,37 @@ extension View {
             let pdf=fixture.appendingPathComponent("mixed.pdf");try require(mixed.write(to:pdf),"mixed text/scanned PDF fixture saved")
             let recognized=try await Task.detached { try DocumentReader.extract(pdf) }.value
             try require(recognized.contains("START 123") && recognized.contains("MIDDLE") && recognized.contains("456"),"per-page extraction preserves text AND scanned pages in mixed PDF")
-            model.draft=""
+            model.draft=""; model.attachments=[]
             model.attach(pdf)
-            for _ in 0..<100 { if model.draft.contains("MIDDLE") { break };try await Task.sleep(nanoseconds:100_000_000) }
-            try require(model.draft.contains("START 123") && model.draft.contains("MIDDLE"),"native PDF attachment uses offline mixed-page recognition")
+            for _ in 0..<100 { if model.attachments.contains(where: { $0.text.contains("MIDDLE") }) { break };try await Task.sleep(nanoseconds:100_000_000) }
+            try require(model.attachments.contains(where: { $0.text.contains("START 123") }) && model.attachments.contains(where: { $0.text.contains("MIDDLE") }),"native PDF attachment uses offline mixed-page recognition")
             let large="START-123\n"+String(repeating:"Текст большого документа.\n",count:1600)+"MIDDLE-456\n"+String(repeating:"Текст большого документа.\n",count:1600)+"END-987"
             let file=fixture.appendingPathComponent("large.txt");try large.write(to:file,atomically:true,encoding:.utf8)
+            model.attachments=[]
             model.draft="Найди маркеры."
             model.attach(file)
-            for _ in 0..<100 { if model.draft.contains("END-987") { break };try await Task.sleep(nanoseconds:100_000_000) }
-            try require(large.count>60000 && model.draft.contains(large),"native attachment imports over 60000 characters with beginning/middle/end intact")
+            for _ in 0..<100 { if model.attachments.contains(where: { $0.text.contains("END-987") }) { break };try await Task.sleep(nanoseconds:100_000_000) }
+            try require(large.count>60000 && model.attachments.contains(where: { $0.text == large }),"native attachment imports over 60000 characters with beginning/middle/end intact")
             _ = try await model.api("/settings",["provider":"openai","mode":"offline","baseURL":base,"model":"fixture","toolsEnabled":false,"contextLimit":4096])
             model.send()
             for _ in 0..<500 { try await Task.sleep(nanoseconds:100_000_000);try await model.refresh();if let job=model.snapshot?.jobs.last,job.status != "running" { break } }
             try require(model.snapshot?.jobs.last?.status == "done","large document sent through native composer and fully processed: "+(model.snapshot?.jobs.last?.error ?? ""))
+            let sent = model.chat?.messages.first(where: { $0.role == "user" && !($0.attachments ?? []).isEmpty })
+            try require(sent?.visibleText == "Найди маркеры.","sent attachment text is separate from visible user prompt")
+            try require(sent?.attachments?.first?.text == large,"sent attachment keeps complete original text after backend refresh")
+            try require(sent?.quoteText.contains("large.txt") == true && sent?.quoteText.contains("START-123") == false,"quoting sent attachment references filename without dumping document")
             let answer=model.chat?.messages.last?.content ?? ""
             try require(answer.contains("START-123") && answer.contains("MIDDLE-456") && answer.contains("END-987"),"all three distant markers reach native final answer")
             try require((model.chat?.messages.last?.artifacts ?? []).count == 3,"original, per-part results and coverage manifest exposed as chat files")
             try await Task.sleep(nanoseconds:1000_000_000)
             try require(SmokeControlView.controls.object(forKey:"document.artifact.original.txt")?.window === window,"document file card mounted visibly in native chat")
+            try require(SmokeControlView.controls.object(forKey:"sent.attachment.large.txt")?.window === window,"sent file is mounted as compact clickable attachment card")
+            try await clickControl("sent.attachment.large.txt")
+            try require(model.documentWindows.last?.isVisible == true,"sent attachment contents open only after explicit click")
+            if let documentWindow=model.documentWindows.last, let scroll=documentWindow.contentView as? NSScrollView, let view=scroll.documentView as? NSTextView {
+                try require(view.string == large,"explicitly opened attachment displays full original without truncation")
+                documentWindow.close()
+            } else { throw AppError(message:"Attachment text window missing") }
             if !CommandLine.arguments.contains("--skip-capture") { try capture("large-document",window) }
             // Test UI deletion using only tiny fixtures, never a user's weights.
             for kind in ["text","image"] {

@@ -124,11 +124,26 @@ struct ChatMessageText: View {
     }
 }
 
+struct ComposerAttachment: Codable, Identifiable {
+    var id: String
+    var name: String
+    var text: String
+}
+
 // Isolated suite in smoke tests; production drafts persist across restarts.
 final class DraftStore {
     let defaults: UserDefaults
     init(defaults: UserDefaults = .standard) { self.defaults = defaults }
     func key(_ project: String, _ chat: String) -> String { "chatDraft." + project + "." + chat }
+    func attachments(_ project: String, _ chat: String) -> [ComposerAttachment] {
+        guard let data = defaults.data(forKey: key(project,chat)+".attachments") else { return [] }
+        return (try? JSONDecoder().decode([ComposerAttachment].self, from:data)) ?? []
+    }
+    func writeAttachments(_ value: [ComposerAttachment], _ project: String, _ chat: String) {
+        guard !project.isEmpty && !chat.isEmpty else { return }
+        if value.isEmpty { defaults.removeObject(forKey:key(project,chat)+".attachments") }
+        else if let data = try? JSONEncoder().encode(value) { defaults.set(data,forKey:key(project,chat)+".attachments") }
+    }
     func read(_ project: String, _ chat: String) -> String { defaults.string(forKey: key(project,chat)) ?? "" }
     func write(_ value: String, _ project: String, _ chat: String) {
         guard !project.isEmpty && !chat.isEmpty else { return }
@@ -142,7 +157,7 @@ enum ChatTranscript {
         let out = NSMutableAttributedString(string: title + "\n\n", attributes: [.font: NSFont.boldSystemFont(ofSize: size+5), .foregroundColor: NSColor.black])
         for message in messages where message.role != "tool" {
             out.append(NSAttributedString(string: (message.role == "user" ? "Ты" : "Помощник") + "\n", attributes: [.font: NSFont.boldSystemFont(ofSize: size), .foregroundColor: NSColor.black]))
-            for block in MarkdownBlocks.parse(message.content) {
+            for block in MarkdownBlocks.parse(message.quoteText) {
                 var text = ""; var font = NSFont.systemFont(ofSize: size)
                 switch block {
                 case .text(let value), .quote(let value): text = value
@@ -181,7 +196,12 @@ struct ProfileVersion: Codable, Identifiable { var id: String; var time: String;
 struct Profile: Codable, Identifiable { var id: String; var name: String; var prompt: String; var versions: [ProfileVersion]? }
 struct MCPServer: Codable, Identifiable { var id: String; var name: String; var command: String; var args: [String]; var enabled: Bool }
 struct Artifact: Codable { var name: String; var path: String; var bytes: Int64 }
-struct ChatMessage: Codable { var artifacts: [Artifact]?; var role: String; var content: String; var streaming: Bool? }
+struct ChatMessage: Codable {
+    var artifacts: [Artifact]?; var role: String; var content: String; var streaming: Bool?
+    var displayText: String?; var attachments: [ComposerAttachment]?
+    var visibleText: String { role == "user" ? (displayText ?? content) : content }
+    var quoteText: String { visibleText + (attachments ?? []).map { "\n[Файл: \($0.name)]" }.joined() }
+}
 struct Chat: Codable, Identifiable {
     var id: String; var title: String; var messages: [ChatMessage]; var skillIDs: [String]; var profileID: String
 }
@@ -207,11 +227,14 @@ struct Pending: Codable, Identifiable {
 struct LocalModelState: Codable { var status: String; var path: String; var error: String }
 struct ModelDownload: Codable, Identifiable { var id: String; var repo: String; var file: String; var status: String; var bytes: Int64; var total: Int64; var path: String; var error: String }
 struct Usage: Codable { var inputTokens: Int; var outputTokens: Int; var reportedRequests: Int; var missingRequests: Int; var sentBytes: Int; var receivedBytes: Int }
+struct EngineMetrics: Codable { var firstTextSeconds: Double?; var requestSeconds: Double?; var outputTokens: Int?; var tokensPerSecond: Double?; var rateBasis: String? }
+struct EngineState: Codable { var status: String; var error: String?; var loadSeconds: Double? }
+struct EngineSnapshot: Codable { var provider: String; var model: String; var state: EngineState; var metrics: EngineMetrics; var rssBytes: Int64?; var canLoad: Bool; var canUnload: Bool }
 struct Thermal: Codable { var cpu: Double?; var gpu: Double?; var state: Int; var limited: Bool }
 struct Permissions: Codable { var all: Bool; var tools: [String] }
 struct Snapshot: Codable {
     var permissions: Permissions?
-    var usage: Usage?; var thermal: Thermal?
+    var usage: Usage?; var thermal: Thermal?; var engine: EngineSnapshot?
     var localModel: LocalModelState?; var downloads: [ModelDownload]?
 
     var settings: Settings; var projects: [Project]; var profiles: [Profile]
@@ -365,7 +388,16 @@ struct BrowserView: NSViewRepresentable {
     @Published var chatID = "" { didSet { selectDraft() } }
     @Published var draft = "" { didSet { draftStore.write(draft, projectID, chatID) } }
     let draftStore = DraftStore(defaults: CommandLine.arguments.contains("--smoke-test") ? UserDefaults(suiteName: "Inij-Smoke-Drafts")! : .standard)
-    func selectDraft() { draft = draftStore.read(projectID, chatID) }
+    @Published var attachments: [ComposerAttachment] = [] {
+        didSet { draftStore.writeAttachments(attachments,projectID,chatID) }
+    }
+    @Published var importingFiles = 0
+    @Published var sending = false
+    var canSend: Bool { snapshot != nil && !chatBusy && !sending && importingFiles == 0 && (!draft.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty || !attachments.isEmpty) }
+    func selectDraft() {
+        draft = draftStore.read(projectID, chatID)
+        attachments = draftStore.attachments(projectID,chatID)
+    }
     @Published var error = ""
     @Published var startup = "Запуск локального сервиса…"
     @Published var showBrowser = false
@@ -385,7 +417,9 @@ struct BrowserView: NSViewRepresentable {
     var seenJobs = Set<String>()
     var project: Project? { snapshot?.projects.first { $0.id == projectID } }
     var chat: Chat? { project?.chats.first { $0.id == chatID } }
-    var running: Bool { snapshot?.jobs.contains { $0.status == "running" } ?? false }
+    var running: Bool { snapshot?.jobs.contains { $0.status == "running" || $0.status == "queued" } ?? false }
+    var chatBusy: Bool { snapshot?.jobs.contains { $0.chatID == chatID && ($0.status == "running" || $0.status == "queued") } ?? false }
+    func cancelJob(_ id: String) { perform { _ = try await self.api("/stop",["id":id]) } }
     var approval: Pending? { snapshot?.pending.first { $0.kind == "approval" } }
     func start() async {
         guard !starting, port == 0 else { return }; starting = true
@@ -423,7 +457,11 @@ struct BrowserView: NSViewRepresentable {
                 while !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: 600_000_000)
                     guard let self, !Task.isCancelled else { return }
-                    do { try await self.refresh() } catch { self.error = "Связь с локальным сервисом: \(error.localizedDescription)" }
+                    do { try await self.refresh() } catch {
+                        // Cancelling a poll during shutdown/test transitions is not a connection failure.
+                        guard !Task.isCancelled else { return }
+                        self.error = "Связь с локальным сервисом: \(error.localizedDescription)"
+                    }
                 }
             }
         } catch { shutdown(); self.error = error.localizedDescription; startup = "Запуск не завершен" }
@@ -449,7 +487,7 @@ struct BrowserView: NSViewRepresentable {
         if project == nil { projectID = snapshot?.projects.first?.id ?? "" }
         if chat == nil { chatID = project?.chats.last?.id ?? "" }
         browser.allow(snapshot?.settings.mode != "offline")
-        for job in snapshot?.jobs ?? [] where job.status != "running" && !seenJobs.contains(job.id) {
+        for job in snapshot?.jobs ?? [] where job.status != "running" && job.status != "queued" && !seenJobs.contains(job.id) {
             seenJobs.insert(job.id)
             if !job.error.isEmpty && job.status == "failed" { error = job.error }
             if let new = job.newChatID { projectID = job.projectID; chatID = new }
@@ -471,14 +509,29 @@ struct BrowserView: NSViewRepresentable {
         Task { do { try await action(); try await refresh() } catch { self.error = error.localizedDescription } }
     }
     func send() {
-        let text = draft; let pid = projectID; let cid = chatID
-        perform { _ = try await self.api("/send", ["projectID": pid, "chatID": cid, "text": text]); if self.projectID == pid && self.chatID == cid && self.draft == text { self.draft = "" } else if self.draftStore.read(pid,cid) == text { self.draftStore.write("",pid,cid) } }
+        guard canSend else { return }
+        let draftText = draft; let pid = projectID; let cid = chatID
+        let sentAttachments = attachments
+        let files = sentAttachments.map { ["id":$0.id,"name":$0.name,"text":$0.text] }
+        sending = true
+        perform {
+            defer { self.sending = false }
+            _ = try await self.api("/send", ["projectID": pid, "chatID": cid, "text": draftText,"attachments":files])
+            let ids = Set(sentAttachments.map { $0.id })
+            if self.projectID == pid && self.chatID == cid {
+                if self.draft == draftText { self.draft = "" }
+                self.attachments.removeAll { ids.contains($0.id) }
+            } else {
+                if self.draftStore.read(pid,cid) == draftText { self.draftStore.write("",pid,cid) }
+                self.draftStore.writeAttachments(self.draftStore.attachments(pid,cid).filter { !ids.contains($0.id) },pid,cid)
+            }
+        }
     }
     func drawImage() {
         let text = draft; let pid = projectID; let cid = chatID
         perform { _ = try await self.api("/image/generate", ["projectID":pid,"chatID":cid,"text":text]); if self.projectID == pid && self.chatID == cid && self.draft == text { self.draft = "" } }
     }
-    func stop() { perform { _ = try await self.api("/stop", [:]); self.browser.webView.stopLoading(); self.browser.finish(AppError(message: "Остановлено")) } }
+    func stop() { let job=snapshot?.jobs.first { $0.chatID == chatID && ($0.status == "running" || $0.status == "queued") }; perform { _ = try await self.api("/stop", job.map { ["id":$0.id] } ?? [:]); self.browser.webView.stopLoading(); self.browser.finish(AppError(message: "Остановлено")) } }
     func newChat() { perform { let r = try await self.api("/chat", ["projectID": self.projectID]); self.chatID = r["id"] as? String ?? "" } }
     func newProject() {
         let alert = NSAlert(); alert.messageText = "Новый проект"; alert.addButton(withTitle: "Создать"); alert.addButton(withTitle: "Отмена")
@@ -545,7 +598,7 @@ struct BrowserView: NSViewRepresentable {
         perform { _ = try await self.api("/chat/change",payload) }
     }
     func editMessage(_ index: Int, _ content: String) {
-        let alert = NSAlert();alert.messageText="Изменить сообщение и ответить заново";alert.informativeText="Последующая история будет сохранена в архиве.";alert.addButton(withTitle:"Отправить");alert.addButton(withTitle:"Отмена")
+        let alert = NSAlert();alert.messageText="Изменить сообщение и ответить заново";alert.informativeText="Вложения сохранятся. Последующая история будет сохранена в архиве.";alert.addButton(withTitle:"Отправить");alert.addButton(withTitle:"Отмена")
         let field = NSTextField(frame:NSRect(x:0,y:0,width:450,height:100));field.stringValue=content;alert.accessoryView=field
         if alert.runModal() == .alertFirstButtonReturn { changeChat("edit",index:index,text:field.stringValue) }
     }
@@ -573,15 +626,18 @@ struct BrowserView: NSViewRepresentable {
         }
     }
     func attach() {
-        let panel = NSOpenPanel(); panel.canChooseFiles = true; panel.canChooseDirectories = false
+        let panel = NSOpenPanel(); panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = true
         panel.message = "До 12 МБ / 2 млн символов. Большие документы читаются по частям. PDF и изображения: локальное распознавание. В облачном режиме текст отправляется выбранному провайдеру."
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        attach(url)
+        guard panel.runModal() == .OK else { return }
+        panel.urls.forEach { attach($0) }
     }
     func attach(_ url: URL) {
         guard url.isFileURL else { error = "Перетащи локальный файл"; return }
+        guard !projectID.isEmpty && !chatID.isEmpty && !running && !sending else { return }
         let pid = projectID; let cid = chatID
+        importingFiles += 1
         perform {
+            defer { self.importingFiles -= 1 }
             let size = (try url.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? 0
             guard size <= 12 * 1024 * 1024 else { throw AppError(message: "Файл больше 12 МБ") }
             var payload: [String: Any] = ["projectID": pid, "path": url.path]
@@ -590,10 +646,11 @@ struct BrowserView: NSViewRepresentable {
                 payload["extractedText"] = try await Task.detached { try DocumentReader.extract(url) }.value
             }
             let r = try await self.api("/attachment", payload)
-            let note = ""
-            let addition = "\n\n[Файл: \(url.lastPathComponent)\(note)]\n\(r["text"] as? String ?? "")\n[Конец файла]\n"
-            if self.projectID == pid && self.chatID == cid { self.draft += addition }
-            else { self.draftStore.write(self.draftStore.read(pid,cid) + addition, pid,cid) }
+            guard let text = r["text"] as? String, !text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty else { throw AppError(message:"В файле нет читаемого текста") }
+            guard r["truncated"] as? Bool != true else { throw AppError(message:"Файл прочитан не полностью. Вложение не добавлено.") }
+            let item = ComposerAttachment(id:UUID().uuidString,name:url.lastPathComponent,text:text)
+            if self.projectID == pid && self.chatID == cid { self.attachments.append(item) }
+            else { self.draftStore.writeAttachments(self.draftStore.attachments(pid,cid) + [item],pid,cid) }
         }
     }
 }
@@ -642,6 +699,11 @@ struct Composer: NSViewRepresentable {
             let urls = Self.fileURLs(sender.draggingPasteboard)
             if !urls.isEmpty { guard let files else { return false }; files(urls); return true }
             return super.performDragOperation(sender)
+        }
+        override func paste(_ sender: Any?) {
+            let urls = Self.fileURLs(.general)
+            if !urls.isEmpty { files?(urls); return }
+            super.paste(sender)
         }
         override func keyDown(with event: NSEvent) {
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -702,7 +764,7 @@ struct MainView: View {
                 HStack { Text("Проекты").font(.headline); Spacer(); Button(action: model.newProject) { Image(systemName: "folder.badge.plus") } }
                 Picker("Проект", selection: $model.projectID) {
                     ForEach(model.snapshot?.projects ?? []) { p in Text(p.name).tag(p.id) }
-                }.labelsHidden().disabled(model.running)
+                }.labelsHidden()
                 List(selection: $model.chatID) {
                     ForEach(model.project?.chats ?? []) { c in
                         Text(c.title).lineLimit(2).tag(c.id).contextMenu {
@@ -711,12 +773,12 @@ struct MainView: View {
                             Button("Экспорт") { model.exportChat(c.id) }
                             Divider()
                             Button("Удалить чат",role:.destructive) { model.chatID=c.id; model.changeChat("delete") }
-                        }.disabled(model.running)
+                        }
                     }
                 }
                 HStack {
                     Button(action: { model.settingsShown=true }) { Image(systemName:"gearshape").font(.title3) }.help("Настройки").accessibilityIdentifier("settings.open").smokeControl("settings.open")
-                    Button(action: model.newChat) { Text("Новый чат").frame(maxWidth:.infinity).padding(.vertical,6) }.disabled(model.running)
+                    Button(action: model.newChat) { Text("Новый чат").frame(maxWidth:.infinity).padding(.vertical,6) }
                 }
             }.buttonStyle(MonochromeButton()).controlSize(.regular).padding(12).frame(width:220)
             Divider()
@@ -732,6 +794,16 @@ struct MainView: View {
                         Text(telemetryLabel).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                             .help("Температуры датчиков, если доступны. Токены — только usage провайдера за запуск; н/д, если не возвращены. Трафик — полезные байты запросов/ответов внешнего API модели, без браузера, загрузок и протокольных накладных расходов.")
                     }.padding(12)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(engineLabel).font(.caption).foregroundStyle(.secondary).accessibilityIdentifier("engine.metrics")
+                        ForEach((model.snapshot?.jobs ?? []).filter { $0.status == "running" || $0.status == "queued" }) { job in
+                            HStack {
+                                Text(job.status == "queued" ? "В очереди · \(chatTitle(job))" : "Выполняется · \(chatTitle(job))").font(.caption)
+                                Spacer()
+                                Button("Отменить") { model.cancelJob(job.id) }.font(.caption)
+                            }
+                        }
+                    }.padding(.horizontal,12).padding(.bottom,6)
                     Divider()
                     if let local = model.snapshot?.localModel, model.snapshot?.settings.provider == "local", local.status == "loading" || local.status == "error" {
                         HStack {
@@ -750,11 +822,25 @@ struct MainView: View {
                                     if message.role != "tool" {
                                         VStack(alignment: .leading, spacing: 6) {
                                             Text(message.role == "user" ? "Ты" : "Помощник").font(.caption.bold()).foregroundStyle(.secondary)
-                                            if message.role == "user" { Button("Изменить") { model.editMessage(index,message.content) }.font(.caption).disabled(model.running) }
-                                            if message.content.count > 12000 { Button("Открыть полный текст…") { model.showFullText(message.content) } }
-                                            Button("Цитировать") { model.draft += (model.draft.isEmpty ? "" : "\n\n") + message.content.components(separatedBy: "\n").map { "> " + $0 }.joined(separator: "\n") + "\n\n" }.font(.caption)
-                                            ChatMessageText(content: message.content.count > 12000 ? String(message.content.prefix(1200))+"\n\n[Большое сообщение: показано начало. Полный текст сохранён и обрабатывается целиком.]" : (message.content.isEmpty && message.streaming == true ? "…" : message.content))
-                                                .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                                            if message.role == "user" { Button("Изменить") { model.editMessage(index,message.visibleText) }.font(.caption).disabled(model.running) }
+                                            if message.visibleText.count > 12000 { Button("Открыть полный текст…") { model.showFullText(message.visibleText) } }
+                                            Button("Цитировать") { model.draft += (model.draft.isEmpty ? "" : "\n\n") + message.quoteText.components(separatedBy: "\n").map { "> " + $0 }.joined(separator: "\n") + "\n\n" }.font(.caption)
+                                            if !message.visibleText.isEmpty || message.streaming == true {
+                                                ChatMessageText(content: message.visibleText.count > 12000 ? String(message.visibleText.prefix(1200))+"\n\n[Большое сообщение: показано начало. Полный текст сохранён и обрабатывается целиком.]" : (message.visibleText.isEmpty ? "…" : message.visibleText))
+                                                    .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                                            }
+                                            ForEach(message.attachments ?? []) { file in
+                                                Button { model.showFullText(file.text) } label: {
+                                                    HStack(spacing:8) {
+                                                        Image(systemName:"doc.text")
+                                                        VStack(alignment:.leading,spacing:3) {
+                                                            Text(file.name).fontWeight(.medium).lineLimit(2)
+                                                            Text("\(file.text.count) символов · Показать содержимое").font(.caption).foregroundStyle(.secondary)
+                                                        }
+                                                    }.padding(9).frame(maxWidth:.infinity,alignment:.leading).contentShape(Rectangle())
+                                                }.buttonStyle(.plain).background(Color.secondary.opacity(0.08)).cornerRadius(7)
+                                                .smokeControl("sent.attachment."+file.name)
+                                            }
                                             ForEach(message.artifacts ?? [],id: \.path) { artifact in
                                                 VStack(alignment:.leading,spacing:4) {
                                                     Label(artifact.name,systemImage:"doc.fill")
@@ -820,16 +906,34 @@ struct MainView: View {
                             .help("Создать картинку по тексту в поле ввода локально, без текстовой модели. Настройки → Модель → Генерация изображений.")
                             .accessibilityIdentifier("image.generate").smokeControl("image.generate")
                             .disabled(model.running || model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.snapshot == nil)
-                        Button(action: { model.attach() }) { Image(systemName: "paperclip") }.disabled(model.running)
+                        Button(action: { model.attach() }) { Image(systemName: "paperclip") }.disabled(model.chatBusy)
                     }.padding(.horizontal,12).padding(.top,8)
                     if let progress=model.snapshot?.jobs.last?.progress, model.running { Text(progress).font(.caption).padding(.horizontal,12) }
-                    Composer(text: $model.draft, enterSends: enterSends, send: { if !model.running { model.send() } }, files: model.running ? nil : { urls in urls.forEach { model.attach($0) } }).frame(height:90).padding(8)
+                    if model.importingFiles > 0 {
+                        HStack { ProgressView().controlSize(.small); Text("Чтение файлов: \(model.importingFiles)").font(.caption) }.padding(.horizontal,12)
+                    }
+                    if !model.attachments.isEmpty {
+                        ScrollView(.horizontal) {
+                            HStack {
+                                ForEach(model.attachments) { item in
+                                    HStack(spacing:6) {
+                                        Image(systemName:"doc.text")
+                                        Text(item.name).lineLimit(1)
+                                        Text("\(item.text.count) симв.").foregroundStyle(.secondary)
+                                        Button { model.attachments.removeAll { $0.id == item.id } } label: { Image(systemName:"xmark.circle.fill") }
+                                            .buttonStyle(.plain).help("Убрать вложение").disabled(model.sending)
+                                    }.font(.caption).padding(8).background(Color.primary.opacity(0.08)).cornerRadius(8)
+                                }
+                            }
+                        }.frame(maxHeight:44).padding(.horizontal,12)
+                    }
+                    Composer(text: $model.draft, enterSends: enterSends, send: { if !model.chatBusy { model.send() } }, files: model.chatBusy ? nil : { urls in urls.forEach { model.attach($0) } }).frame(height:90).padding(8)
                     HStack {
                         Button("Повторить ответ") { model.changeChat("retry") }.disabled(model.running || (model.chat?.messages.isEmpty ?? true))
                         Text(enterSends ? "↩ — отправить · ⇧↩ — новая строка" : "⌘↩ — отправить · ↩ — новая строка").font(.caption).foregroundStyle(.secondary)
                         Spacer()
-                        if model.running { Button("Стоп", action: model.stop).keyboardShortcut(.escape,modifiers: []) }
-                        else { Button("Отправить",action: model.send).keyboardShortcut(.return,modifiers: .command).disabled(model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.snapshot == nil) }
+                        if model.chatBusy { Button("Стоп", action: model.stop).keyboardShortcut(.escape,modifiers: []) }
+                        else { Button("Отправить",action: model.send).keyboardShortcut(.return,modifiers: .command).disabled(!model.canSend) }
                     }.padding(12)
                 }.frame(minWidth: 480, maxWidth: .infinity)
                 if model.showBrowser {
@@ -869,6 +973,17 @@ struct MainView: View {
         let operation = NSPrintOperation(view:view, printInfo:info)
         operation.showsPrintPanel = true; operation.showsProgressPanel = true
         operation.run()
+    }
+    func chatTitle(_ job: Job) -> String {
+        model.snapshot?.projects.first(where: { $0.id == job.projectID })?.chats.first(where: { $0.id == job.chatID })?.title ?? "Чат"
+    }
+    var engineLabel: String {
+        guard let e=model.snapshot?.engine else { return "Движок: н/д" }
+        func seconds(_ n: Double?) -> String { n.map { String(format:"%.2f с",$0) } ?? "н/д" }
+        let memory=e.rssBytes.map { ByteCountFormatter.string(fromByteCount:$0,countStyle:.memory) } ?? "н/д"
+        let rate=e.metrics.tokensPerSecond.map { String(format:"%.1f ток/с",$0) } ?? "н/д"
+        let basis=e.metrics.rateBasis == "provider_eval" ? "генерация сервера" : "весь запрос"
+        return "\(e.provider) · загрузка \(seconds(e.state.loadSeconds)) · первый текст \(seconds(e.metrics.firstTextSeconds)) · \(rate) (\(basis)) · RAM процесса \(memory)"
     }
     var telemetryLabel: String {
         let t=model.snapshot?.thermal
@@ -1122,6 +1237,14 @@ struct SettingsView: View {
                 } }.frame(maxHeight:.infinity)
             }
             .disabled(model.running)
+            if model.snapshot?.settings.provider == "ollama" {
+                HStack {
+                    Button("Загрузить Ollama") { model.perform { _ = try await model.api("/engine/load",[:]) } }
+                    Button("Выгрузить Ollama") { model.perform { _ = try await model.api("/engine/unload",[:]) } }
+                }.disabled(model.running)
+                Text("Действует на сохранённые настройки Ollama. Адрес сервера определяет, где работает модель.").font(.caption)
+            }
+            if model.snapshot?.settings.provider == "openai" { Text("Загрузкой и выгрузкой модели управляет сервер API.").font(.caption) }
             if model.running { Text("Модель работает. Настройки можно закрыть без сохранения — ответ продолжит генерироваться.").font(.caption).foregroundStyle(.secondary) }
             if !model.error.isEmpty { Text(model.error).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
             HStack {

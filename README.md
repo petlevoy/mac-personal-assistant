@@ -25,7 +25,7 @@ CI обязан пройти backend-тесты, настоящий GGUF inferen
 - Поиск Brave, Tavily и Serper; ключи в macOS Keychain. Ключи не записываются в состояние и не экспортируются. Живые запросы провайдеров без пользовательских ключей не проверялись.
 - MCP stdio: регистрация локального исполняемого файла и аргументов, инициализация, `tools/list`, `tools/call`. Каждый запуск/вызов требует подтверждения. Сервер получает права пользователя, не является sandbox. Обратные sampling/elicitation-вызовы не разрешаются. HTTP MCP и ключи окружения серверов пока не поддержаны.
 - Чтение, буквальный поиск и запись файлов в выбранной папке, команды с подтверждением, ограничением времени и остановкой процесса. Запись сохраняет прежний файл.
-- Вложения TXT/CSV/JSON/MD, DOCX/XLSX/PPTX, текстовый PDF, OCR изображений и сканированных PDF до 80 страниц. Результат вставляется в черновик для проверки перед отправкой.
+- Вложения TXT/CSV/JSON/MD, DOCX/XLSX/PPTX, текстовый PDF, OCR изображений и сканированных PDF. Добавление скрепкой (несколько файлов) или перетаскиванием в поле ввода; отдельные удаляемые карточки не заполняют поле вопроса текстом файла. Лимиты актуального импорта — в разделе 0.3.9 ниже.
 - Инструмент `create_document`: заполнение текстовых меток `{{name}}` в DOCX/XLSX-шаблоне внутри рабочей папки, отдельный выходной файл, подтверждение. Метки должны находиться целиком в одном текстовом узле; разделенные форматированием метки дают ошибку, а не неполный результат. Это не произвольный визуальный редактор Word/Excel.
 - Автосохранение, экспорт ZIP, восстановление ZIP с проверкой путей, симлинков и распакованного объема. Перед восстановлением сохраняются ZIP и предыдущая папка данных. Внешние рабочие папки отвязываются, импортированные MCP-серверы выключаются.
 - Явные режимы: только локально / локальная модель с интернетом / облачная модель. Автоматического перехода в облако нет. В offline отключены браузер, поисковые API, команды и MCP.
@@ -152,3 +152,61 @@ arm64 воспроизводятся scripts/install-image-runtime.sh. Лице�
 Проверки нового маршрута: `tests/test_documents_delete.py`, `scripts/verify_documents_native.py`, `scripts/verify_real_document.py`; сборка — `scripts/build-039.sh`. Нативный smoke использует только одноразовые маленькие модели, не пользовательские веса. Перед финальной упаковкой после любого изменения исходников повторно собери бинарник и подпись.
 
 Сборочные предохранители 0.3.9: диагностический Python запускай с `-B` (или вне подписанного app), иначе `__pycache__` меняет sealed resources. Упаковка всегда создаёт новую staging-папку: `ditto` поверх старой сохранял удалённые `.pyc`, отчего смонтированный DMG не проходил `codesign --verify`. Большие сообщения в SwiftUI показываются компактно с открытием полного текста; полный rich-text на десятках тысяч символов давал пустой/неустойчивый viewport. Файловые карточки разрешены и у assistant-сообщений, а не только tool-результатов; после завершения ответа чат прокручивается к ним.
+
+
+### Native smoke in the macOS VM
+
+The VM can expose active display 1 while `CGMainDisplayID()` returns 0. In this state, `NSApp.postEvent` changed a synthetic click from window-local y=624 to y=-506 (one 1130-point screen height). Unlocking, pointer warping and longer down/up delays did not fix it. `clickControl` therefore dispatches SwiftUI gestures directly and normalizes the queued release used by AppKit list-cell and checkbox tracking from its Quartz coordinate before delivery. Both paths use the mounted control's geometry and actual hit-testing, never its model closure. Direct down followed by an async up is unsuitable for native Toggle controls: their nested tracking loop blocks the async continuation. Preserve the open/close, settings and confirmed/cancelled deletion assertions.
+
+`cacheDisplay` PNGs include transparent backgrounds; a viewer that ignores alpha can show white button silhouettes. The smoke capture helper composites on the window's appearance-resolved background and saves opaque pixels. This is an app-view render, not a capture of the entire desktop. Desktop `screencapture` is not a prerequisite for these app-local screenshots.
+
+### Sent attachment presentation (2026-11-19)
+
+`/send` accepts question text and a separate `attachments` array. The persisted user
+message keeps the full model input in `content` and independent `displayText` plus
+attachment metadata for the chat. Provider requests still contain the complete file
+text (or the existing explicitly labelled document-mode summary on later turns).
+The native chat shows filename cards; clicking a card opens the full extracted text
+in a separate window. Quote and print include filenames, not extracted bodies;
+editing the question and retrying preserve the attachments. Complete legacy inline
+`[Файл: …]` blocks are recognized on load without changing the original model text.
+Unterminated blocks are left visible. Regression coverage: backend persistence,
+provider payload, HTTP transport, edit/retry and legacy migration; native document
+smoke additionally checks the compact card and explicit open action. Native build
+verification is recorded separately in the task completion report.
+
+
+## Выпуск 0.4.0 — компактные отправленные вложения
+
+В истории чата показаны вопрос и карточка файла, а полный извлечённый текст сохраняется для модели. Нажатие на карточку открывает отдельное окно полного текста; цитирование и печать не разворачивают тело файла. Редактирование и повторный запрос сохраняют вложения. Полная площадь карточки участвует в нажатии; выделение текста ограничено текстом сообщения, а не кнопками вложений. Сборочный сценарий `scripts/build-039.sh` берёт номер выпуска из `macos/Info.plist`.
+
+Native UI smoke: `window != nil` у SwiftUI geometry anchor подтверждает mount, но не видимость в прокручиваемом чате. После автопрокрутки к ответу карточка отправленного файла может оказаться за clip viewport, при этом hitTest попадает в toolbar. Перед click-тестом карточки выполняется `scrollToVisible`, проверяется пересечение `bounds` и `visibleRect`, затем отправляются обычные mouse down/up. Не применять эту прокрутку ко всем toolbar-контролам: это меняет геометрию SwiftUI anchor. Исправление только `contentShape` без прокрутки не решало этот сбой теста.
+
+## 0.4.1 — engine management
+
+`backend/engines.py` holds separate bundled llama.cpp, Ollama and OpenAI-compatible
+request/stream adapters. A single FIFO worker runs text jobs across chats; up to 20
+requests may wait. One pending/running request per chat prevents stale-context and
+interleaved-message races. New chats and navigation remain available while generating.
+Each running/queued row can be cancelled independently; Stop targets the current chat.
+Settings and destructive history/model operations remain locked until work settles.
+Queues are session-only, never replayed after restart. Image jobs remain exclusive.
+
+Bundled models load/unload locally. Ollama lifecycle uses `/api/generate` with
+`keep_alive`; its configured server owns the process. OpenAI-compatible APIs do not
+standardize load/unload, so those controls are deliberately unavailable for that adapter.
+Ollama controls act on saved settings. Existing local-model library controls remain.
+
+Measurements: model readiness latency (local health check; Ollama lifecycle request),
+time from starting a model call to first nonempty content (includes local model load),
+and actual resident memory of the owned llama-server process (`ps rss`, not file size,
+not a claim of total unified/GPU memory). Remote memory stays unavailable. Token counts
+come only from provider usage. Ollama `eval_duration` supplies generation throughput;
+otherwise throughput uses the **whole HTTP request** duration, explicitly labelled in UI.
+No provider counts means no token/s estimate. Metrics show the latest model call, not a
+sum across tool rounds or document chunks; switching model/provider clears them.
+
+Verification: `tests/test_engines.py` covers protocol/tool deltas, FIFO, queued and active
+cancellation, settings guards, lifecycle protocol and missing usage. Native smoke covers
+sending a second chat into the queue, cancellation and metrics decoding. Run
+`scripts/verify_engine_metrics.py <app> <existing GGUF>` for real-model load/RSS/usage/unload.

@@ -4,7 +4,7 @@ import xml.etree.ElementTree as ET
 
 class Features:
     def idle(self):
-        if any(j['status']=='running' for j in self.jobs.values()):
+        if getattr(self,'queue',[]) or any(j['status'] in ('running','queued') for j in self.jobs.values()):
             raise ValueError('Сначала останови генерацию')
     def profile_save(self,data):
         from core import uid
@@ -53,10 +53,12 @@ class Features:
                 if action=='retry':
                     index=next((i for i in range(len(c['messages'])-1,-1,-1) if c['messages'][i]['role']=='user'),-1)
                 if index<0 or index>=len(c['messages']) or c['messages'][index]['role']!='user': raise ValueError('Выбери сообщение пользователя')
-                text=str(data.get('text',c['messages'][index]['content']))
-                if not text.strip(): raise ValueError('Пустое сообщение')
+                original=c['messages'][index]
+                text=str(data.get('text',original.get('displayText',original['content'])))
+                attachments=original.get('attachments')
+                if not text.strip() and not attachments: raise ValueError('Пустое сообщение')
                 c['messages']=c['messages'][:index]; self.save()
-                return {'id':self.start(pid,cid,text)}
+                return {'id':self.start(pid,cid,text,attachments=attachments)}
             else: raise ValueError('Неизвестное действие')
             self.save(); return {'ok':True}
     def restore_backup(self,source):
