@@ -44,7 +44,7 @@ def report(store, pid, probe=False):
                     response.read(1024); result['connections']['probe']={'reachable':True,'httpStatus':response.status}
             except urllib.error.HTTPError as e: result['connections']['probe']={'reachable':True,'httpStatus':e.code}
             except Exception as e: result['connections']['probe']={'reachable':False,'error':redact(str(e),secrets)}
-    runtime_log=store.root/'model-runtime.log' 
+    runtime_log=store.root/'model-runtime.log'
     if runtime_log.exists():
         with runtime_log.open('rb') as f:
             f.seek(max(0,runtime_log.stat().st_size-4000)); result['textRuntimeLog']=f.read(4000).decode(errors='replace')
