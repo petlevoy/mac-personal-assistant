@@ -28,6 +28,10 @@ report = pathlib.Path(sys.argv[2]).resolve()
 command = [str(app / 'Contents/MacOS/PersonalAssistant'), '-ApplePersistenceIgnoreState', 'YES', '--smoke-test', str(report)]
 if '--launchservices' in sys.argv:
     command = ['/usr/bin/open', '-n', '-F', '-W', '-a', str(app), '--args', '-ApplePersistenceIgnoreState', 'YES', '--smoke-test', str(report), '--skip-capture','--skip-keychain']
+if '--language' in sys.argv:
+    language=sys.argv[sys.argv.index('--language')+1]
+    assert language in ('en','ru','fr')
+    command += ['-AppleLanguages','('+language+')']
 command += ['--settings-busy-smoke-base', fixture_base]
 if '--skip-keychain' in sys.argv: command += ['--skip-keychain']
 proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

@@ -1,3 +1,23 @@
+# General update 0.4.2 · build 15
+
+Current authoritative source: this directory. Installation is not performed automatically.
+
+- One Models screen: repository search and variants on the left, downloaded library on the right, download controls below. Repository pipeline tags describe purpose when provided; unknown purpose is explicit. GGUF format is not a guarantee of architecture/tool compatibility; engine loading is the final check.
+- System-language Russian/English UI (other languages fall back to English), lowercase `inij` author, no message editing button. Right-click Quote/Copy use the selected fragment, otherwise the complete original message.
+- File tools use project scope. Shell commands now use macOS Seatbelt filesystem containment; network follows the application mode. MCP runs with a sanitized environment, project + explicit roots, and a separate network grant. Unsupported sandbox hosts fail closed. Runtime/system libraries are read-only exceptions, not grants to the user's home.
+- `run_command` with `outsideSandbox: true` and a nonempty `reason` always asks for a single-use approval of the exact command. Persistent tool/all grants cannot approve or persist this escalation. Offline network denial remains in force even for an escalated action.
+- Skill folder catalogs discover SKILL.md through three directory levels, exclude symlinks, refresh before context construction and with Refresh catalog. Name keywords or frontmatter `triggers: spreadsheet, таблица` auto-activate; manual toggles also work. Activation does not grant execution rights. Removed skills are not silently re-added.
+- Requested context budget, GGUF-declared model window and optional configured server limit are distinct. Effective local window uses the declared cap. KV-cache memory is not guessed; successful engine load is required. No universal 128K cap.
+- `diagnose_app` and Settings → Advanced → Diagnostics expose actual OS/app paths, model/header checks, engines, resources, sensors, MCP/skills and bounded redacted logs. Provider connection checks are read-only, bounded to three seconds and constrained by current mode. Diagnostics do not change settings or start arbitrary MCP processes.
+- Image failures preserve exit code and bounded diagnostic output, with last execution details available to diagnostics. The original user's particular checkpoint failure cannot be diagnosed retroactively without its log. Known SD fixture generation is verified separately.
+- Traffic is external model API payload bytes, not all network traffic. It remains unavailable before a successful external request; missing sensor and token readings are not invented. Physical M4 Max sensor availability is not established by VM checks.
+
+Search provider live verification: Brave tested using the existing host key. Tavily/Serper retain mock coverage; no live keys available on the host. No claims about those live services.
+
+Build: `bash scripts/build-039.sh` on the configured Apple Silicon VM. It runs backend, native UI/document/image, signature and final read-only DMG/temporary installed-copy LaunchServices checks. It no longer copies to the user's Desktop or replaces their installed app. Additional language check: `python -I -B scripts/verify_native.py build/Inij.app build/native-en.json --skip-keychain --language en`.
+
+The historical sections below describe earlier releases and are superseded by this section where they differ (notably shell/MCP isolation, editing, paths and localization).
+
 # Inij для macOS
 
 SwiftUI-приложение для Apple Silicon Mac с собственным окном и значком в Dock, локальным сервисом внутри `.app`, сохранением данных и встроенным браузером.

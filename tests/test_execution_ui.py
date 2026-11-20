@@ -4,6 +4,7 @@ from test_core import CoreTests, FakeModel
 from core import available_tools, offline_shell_available
 
 class ExecutionTests(CoreTests):
+    @unittest.skipUnless(__import__("sys").platform == "darwin", "macOS sandbox kernel test")
     def test_command_tool_roundtrip(self):
         self.store.update_settings({'mode':'internet'})
         self.store.await_action=lambda *a: {'approved':True}

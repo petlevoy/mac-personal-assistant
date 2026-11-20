@@ -18,7 +18,7 @@ class OpenAIAdapter:
         for t in delta.get('tool_calls',[]):
             c=calls.setdefault(t.get('index',0),{'id':t.get('id') or str(uuid.uuid4()),'type':'function','function':{'name':'','arguments':''}})
             f=t.get('function',{}); c['function']['name']+=f.get('name',''); c['function']['arguments']+=f.get('arguments','')
-        return {'text':delta.get('content') or '', 'usage':data.get('usage'),'length':choice.get('finish_reason')=='length'}
+        return {'text':delta.get('content') or '', 'reasoning':delta.get('reasoning_content') or delta.get('thinking') or '', 'usage':data.get('usage'),'length':choice.get('finish_reason')=='length'}
 
 class LlamaAdapter(OpenAIAdapter):
     def request(self,s,messages,tools):
@@ -42,7 +42,7 @@ class OllamaAdapter:
         usage=None
         if data.get('done') and 'prompt_eval_count' in data and 'eval_count' in data:
             usage={'prompt_tokens':data['prompt_eval_count'],'completion_tokens':data['eval_count']}
-        return {'text':delta.get('content') or '', 'usage':usage,'length':data.get('done_reason')=='length', 'evalSeconds':data.get('eval_duration',0)/1e9 if isinstance(data.get('eval_duration'),(int,float)) else None}
+        return {'text':delta.get('content') or '', 'reasoning':delta.get('reasoning_content') or delta.get('thinking') or '', 'usage':usage,'length':data.get('done_reason')=='length', 'evalSeconds':data.get('eval_duration',0)/1e9 if isinstance(data.get('eval_duration'),(int,float)) else None}
 
 ADAPTERS={'local':LlamaAdapter(),'openai':OpenAIAdapter(),'ollama':OllamaAdapter()}
 

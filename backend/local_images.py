@@ -86,6 +86,7 @@ def generate(store, job, args, settings):
         env={k:v for k,v in os.environ.items() if k in ('HOME','TMPDIR','LANG','LC_ALL','PATH')}
         job['detail']='Локальная генерация ('+('CPU' if compute=='cpu' else 'авто / Metal')+'): загрузка модели и создание изображения…'
         tail=bytearray()
+        store.data['imageLastRun']={'model':str(model),'command':command[3:],'compute':compute,'status':'running'}; store.save()
         process=subprocess.Popen(command,cwd=temp,env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,start_new_session=True)
         with _LOCK: _ACTIVE.add(process)
         def consume():
@@ -103,15 +104,18 @@ def generate(store, job, args, settings):
             reader.join(timeout=3)
             if job['stop'].is_set(): raise InterruptedError('Остановлено')
             if process.returncode != 0 or not output.is_file():
-                detail=tail.decode('utf-8',errors='replace')[-1500:]
+                from diagnostics import redact
+                detail=redact(tail.decode('utf-8',errors='replace')[-1500:],store.secrets.values())
+                store.data['imageLastRun'].update(status='failed',exitCode=process.returncode,stderr=detail); store.save()
                 store.log(job['projectID'],'Локальный генератор: ошибка',detail)
-                raise ValueError('Локальная генерация не завершилась (код '+str(process.returncode)+'). Проверь полный SD checkpoint, память и режим CPU. Подробности — в журнале проекта.')
+                raise ValueError('Локальная генерация не завершилась (код '+str(process.returncode)+'). '+(detail or 'No diagnostic output returned; cause unknown.'))
             if output.is_symlink() or not 0 < output.stat().st_size <= MAX_FILE: raise ValueError('Генератор вернул недопустимый размер изображения')
             image=output.read_bytes()
             if not image.startswith(b'\x89PNG\r\n\x1a\n'): raise ValueError('Генератор не вернул PNG')
             relative='generated-'+uid()+'.png'; destination=safe_path(root,relative)
             with destination.open('xb') as f: f.write(image)
             os.chmod(destination,0o600)
+            store.data['imageLastRun'].update(status='done',exitCode=0); store.save()
             return {'path':relative,'model':model.name,'bytes':len(image),'provider':'local','compute':compute}
         finally:
             terminate(process); reader.join(timeout=3)

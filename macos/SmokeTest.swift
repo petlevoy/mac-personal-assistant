@@ -78,6 +78,19 @@ extension View {
         }
         UserDefaults.standard.set(savedTheme, forKey: "appearanceTheme")
         try await Task.sleep(nanoseconds: 300_000_000)
+        let quoteView=QuoteTextView()
+        quoteView.string="Alpha beta gamma";quoteView.wholeMessage="Whole original message"
+        var quoted="";quoteView.quoteAction={ quoted=$0 }
+        quoteView.setSelectedRange(NSRange(location:6,length:4));quoteView.quoteSelection()
+        try require(quoted == "beta","context Quote uses selected fragment")
+        quoteView.copySelection();try require(NSPasteboard.general.string(forType:.string) == "beta","context Copy uses selected fragment")
+        quoteView.setSelectedRange(NSRange(location:0,length:0));quoteView.quoteSelection()
+        try require(quoted == "Whole original message","context Quote without selection uses entire message")
+        let menuEvent=NSEvent.mouseEvent(with:.rightMouseDown,location:.zero,modifierFlags:[],timestamp:0,windowNumber:window.windowNumber,context:nil,eventNumber:1,clickCount:1,pressure:1)!
+        try require(quoteView.menu(for:menuEvent)?.items.map { $0.title } == [L("Цитировать","Quote"),L("Копировать","Copy")],"context menu contains exactly Quote and Copy")
+        report["uiLanguage"] = Locale.preferredLanguages.first ?? "unknown"
+        try require(L("Настройки","Settings") == ((Locale.preferredLanguages.first ?? "en").hasPrefix("ru") ? "Настройки" : "Settings"),"system language selects Russian or English fallback")
+        try require(model.snapshot?.projectsRoot != nil && model.snapshot?.contextBudget != nil,"project storage and context metadata decoded")
         let input = Composer.Input(frame:NSRect(x:0,y:0,width:200,height:80))
         var submissions=0
         input.submit = { submissions += 1 }
@@ -549,11 +562,11 @@ extension View {
                     }
                     RunLoop.main.add(timer,forMode:.modalPanel)
                 }
-                chooseAlert("Отмена");try await clickControl("model.delete",in:testWindow)
+                chooseAlert(L("Отмена","Cancel"));try await clickControl("model.delete",in:testWindow)
                 try await Task.sleep(nanoseconds:1200_000_000)
                 try require(FileManager.default.fileExists(atPath:path.path),kind+" deletion cancelled through confirmation dialog")
                 if !CommandLine.arguments.contains("--skip-capture") { try capture("model-library-"+kind,testWindow) }
-                chooseAlert("В Корзину");try await clickControl("model.delete",in:testWindow)
+                chooseAlert(L("В Корзину","Move to Trash"));try await clickControl("model.delete",in:testWindow)
                 for _ in 0..<60 { if !FileManager.default.fileExists(atPath:path.path) { break };try await Task.sleep(nanoseconds:100_000_000) }
                 try require(!FileManager.default.fileExists(atPath:path.path),kind+" fixture deleted using library mouse click and confirmed dialog")
                 try await model.refresh();try require((kind == "text" ? model.snapshot?.settings.model : model.snapshot?.settings.imageLocalModel) == "",kind+" deleted selection cleared")

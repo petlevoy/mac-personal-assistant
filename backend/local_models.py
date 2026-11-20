@@ -65,6 +65,8 @@ class LocalModels:
             self.state={'status':'idle','path':'','error':''}; self.port=0
     def load(self,path,context=8192):
         info=gguf_info(path); path=info['path']
+        from context_budget import budget
+        context=budget({'provider':'local','model':path,'contextLimit':context})['effective']
         try: memory=os.sysconf('SC_PAGE_SIZE')*os.sysconf('SC_PHYS_PAGES')
         except (ValueError,OSError): memory=0
         # macOS sysconf may not expose PHYS_PAGES; sysctl provides physical RAM.
@@ -126,7 +128,7 @@ class LocalModels:
     def search(self,query):
         args=urllib.parse.urlencode({'search':query[:200],'filter':'gguf','sort':'downloads','direction':-1,'limit':30})
         data=fetch(HF+'/api/models?'+args)
-        return [{'id':v['id'],'downloads':v.get('downloads',0),'likes':v.get('likes',0)} for v in data]
+        return [{'id':v['id'],'downloads':v.get('downloads',0),'likes':v.get('likes',0),'task':v.get('pipeline_tag') or 'unknown'} for v in data]
     def files(self,repo):
         repo=repo_id(repo); data=fetch(HF+'/api/models/'+repo+'?blobs=true')
         return [{'name':v['rfilename'],'size':v.get('size') or v.get('lfs',{}).get('size',0),

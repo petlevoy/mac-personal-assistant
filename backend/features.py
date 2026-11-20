@@ -93,6 +93,7 @@ class Features:
                 pid=project['id']
                 if not re.fullmatch(r'[a-zA-Z0-9-]{1,80}',pid): raise ValueError('Неверный ID проекта')
                 project['workspace']=str(self.root/'projects'/pid/'files')
+                project['skillRoots']=[]; project['ignoredSkills']=[]
                 (stage/'projects'/pid/'files').mkdir(parents=True,exist_ok=True)
                 for skill in project['skills']:
                     sid=skill['id']
@@ -146,6 +147,10 @@ class Features:
         args=config.get('args',[])
         if not name or not command or not isinstance(args,list) or not all(isinstance(a,str) for a in args): raise ValueError('Нужны имя, исполняемый файл и массив аргументов')
         item={'id':config.get('id') or uid(),'name':name[:80],'command':command,'args':args,'enabled':bool(config.get('enabled',True))}
+        from sandbox import roots
+        item['readRoots']=[str(p) for p in roots(config.get('readRoots',[]))]
+        item['writeRoots']=[str(p) for p in roots(config.get('writeRoots',[]))]
+        item['allowNetwork']=config.get('allowNetwork') is True
         with self.lock:
             self.data.setdefault('mcp',[])
             self.data['mcp']=[v for v in self.data['mcp'] if v['id']!=item['id']]+[item]; self.save()

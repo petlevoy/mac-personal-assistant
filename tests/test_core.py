@@ -221,11 +221,13 @@ class CoreTests(unittest.TestCase):
     def test_offline_blocks_network_tools_and_shell(self):
         for name in ['web_search','browser_open','browser_read'] + ([] if offline_shell_available() else ['run_command']):
             with self.assertRaises(ValueError): self.store.execute(self.job(),name,{},self.store.data['settings'])
+    @unittest.skipUnless(__import__("sys").platform == "darwin", "macOS sandbox kernel test")
     def test_command_and_reject(self):
         settings={**self.store.data['settings'],'mode':'internet'}
         self.store.await_action=lambda *a: {'approved':True}
         result=self.store.execute(self.job(),'run_command',{'command':'printf command_ok'},settings)
         self.assertEqual(result['output'],'command_ok'); self.assertEqual(result['exitCode'],0)
+    @unittest.skipUnless(__import__("sys").platform == "darwin", "macOS sandbox kernel test")
     def test_background_command_does_not_hold_pipe(self):
         settings={**self.store.data['settings'],'mode':'internet'}
         self.store.await_action=lambda *a: {'approved':True}

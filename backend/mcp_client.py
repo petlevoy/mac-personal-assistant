@@ -2,8 +2,9 @@
 import json,os,queue,signal,subprocess,threading,time,pathlib
 
 def request(server,method,params,stop):
-    env={'PATH':'/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin','HOME':str(pathlib.Path.home()),'LANG':'en_US.UTF-8'}
-    proc=subprocess.Popen([server['command'],*server['args']],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env,start_new_session=True)
+    from sandbox import launch
+    command,env=launch([server['command'],*server['args']],server['workspace'],server.get('readRoots',[]),server.get('writeRoots',[]),server.get('allowNetwork',False))
+    proc=subprocess.Popen(command,cwd=server['workspace'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env,start_new_session=True)
     incoming=queue.Queue(maxsize=200); deadline=time.monotonic()+45
     def reader():
         try:

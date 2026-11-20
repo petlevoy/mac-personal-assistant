@@ -29,6 +29,5 @@ ln -s /Applications "$stage/Applications"
 hdiutil create -ov -volname Inij -srcfolder "$stage" -format UDZO "$PWD/dist/${dmg}"
 "$python_bin" -I -B scripts/verify_installer.py "$PWD/dist/${dmg}" "$PWD/build/installed-final.json"
 codesign --verify --deep --strict "$app"
-cp "$PWD/dist/${dmg}" /Users/viktor/Desktop/${dmg}
-shasum -a 256 "$PWD/dist/${dmg}" /Users/viktor/Desktop/${dmg}
-stat -f '%z %N' /Users/viktor/Desktop/${dmg}
+shasum -a 256 "$PWD/dist/${dmg}"
+stat -f '%z %N' "$PWD/dist/${dmg}"

@@ -90,6 +90,7 @@ class FeatureTests(unittest.TestCase):
   with self.assertRaises(ValueError):self.s.template_document(root,'template.docx','missing.docx',{'unknown':'x'})
   self.assertFalse((root/'missing.docx').exists())
   with self.assertRaises(ValueError):self.s.template_document(root,'template.docx','../escape.docx',{'name':'x'})
+ @unittest.skipUnless(__import__("sys").platform == "darwin", "macOS sandbox kernel test")
  def test_mcp_stdio_initialize_list_call_and_cleanup(self):
   server=self.root/'mcp.py';server.write_text('''import sys,json
 for line in sys.stdin:
@@ -98,7 +99,7 @@ for line in sys.stdin:
  result={'tools':[{'name':'echo','inputSchema':{'type':'object'}}]} if r['method']=='tools/list' else {'content':[{'type':'text','text':r.get('params',{}).get('arguments',{}).get('message','')}]}
  print(json.dumps({'jsonrpc':'2.0','id':r['id'],'result':result}),flush=True)
 ''')
-  config=self.s.mcp_save({'name':'test','command':sys.executable,'args':[str(server)]});self.s.update_settings({'mode':'internet'})
+  config=self.s.mcp_save({'name':'test','command':sys.executable,'args':[str(server)],'readRoots':[str(self.root),str(pathlib.Path(sys.executable).resolve().parent.parent)]});self.s.update_settings({'mode':'internet'})
   with patch.object(self.s,'await_action',return_value={'approved':True}):
    self.assertEqual(self.s.execute(self.job(),'mcp_list',{'serverID':config['id']},self.s.data['settings'])['tools'][0]['name'],'echo')
    result=self.s.execute(self.job(),'mcp_call',{'serverID':config['id'],'name':'echo','arguments':{'message':'hello'}},self.s.data['settings'])

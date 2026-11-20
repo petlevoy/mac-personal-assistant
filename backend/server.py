@@ -7,6 +7,9 @@ from core import Store, MAX_FILE, extract_text, context_size, uid
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args): pass
     def send_json(self,value,status=200):
+        if not self.headers.get('Accept-Language','ru').lower().startswith('ru'):
+            from localization import presentation
+            value=presentation(value)
         data=json.dumps(value,ensure_ascii=False).encode()
         self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8')
         self.send_header('Content-Length',str(len(data))); self.send_header('Cache-Control','no-store'); self.end_headers()
@@ -74,9 +77,18 @@ class Handler(BaseHTTPRequestHandler):
                     if 'profileID' in data: c['profileID']=data['profileID']
                     s.save()
             elif self.path=='/skill': return self.send_json({'id':s.import_skill(data['projectID'],data['path'])})
+            elif self.path=='/diagnostics':
+                from diagnostics import report
+                return self.send_json(report(s,data['projectID'],probe=True))
+            elif self.path=='/skills/refresh':
+                from skill_catalog import refresh
+                return self.send_json({'ids':refresh(s,data['projectID'])})
             elif self.path=='/skill/remove':
                 with s.lock:
-                    p=s.project(data['projectID']); p['skills']=[x for x in p['skills'] if x['id']!=data['id']]
+                    p=s.project(data['projectID'])
+                    ignored=next((x.get('source') for x in p['skills'] if x['id']==data['id']),None)
+                    if ignored: p.setdefault('ignoredSkills',[]).append(ignored)
+                    p['skills']=[x for x in p['skills'] if x['id']!=data['id']]
                     for c in p['chats']: c['skillIDs']=[v for v in c['skillIDs'] if v!=data['id']]
                     s.save() # Files kept for backup; no silent destructive delete.
             elif self.path=='/context':
